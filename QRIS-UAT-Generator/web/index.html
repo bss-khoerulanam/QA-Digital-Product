@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QRIS UAT Document Generator - BSS</title>
+    <!-- Load libraries from local files (offline mode) -->
+    <!-- Jika ingin CDN, ganti src ke:
+         https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+         https://unpkg.com/docx@8.5.0
+         https://unpkg.com/file-saver@2.0.5/dist/FileSaver.min.js
+    -->
+    <script src="xlsx.full.min.js"></script>
+    <script src="docx.min.js"></script>
+    <script src="FileSaver.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        .header p {
+            font-size: 14px;
+            opacity: 0.8;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+        }
+        .card h2 {
+            color: #1e3a5f;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        .drop-zone {
+            border: 3px dashed #ccc;
+            border-radius: 12px;
+            padding: 50px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #f8f9fa;
+        }
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: #2d5a87;
+            background: #e8f0fe;
+        }
+        .drop-zone.has-file {
+            border-color: #28a745;
+            background: #e8f5e9;
+        }
+        .drop-zone-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        .drop-zone-text {
+            font-size: 16px;
+            color: #666;
+        }
+        .drop-zone-text strong {
+            color: #2d5a87;
+        }
+        .file-info {
+            margin-top: 15px;
+            padding: 12px;
+            background: #e8f5e9;
+            border-radius: 8px;
+            color: #2e7d32;
+            font-weight: 500;
+            display: none;
+        }
+        .file-info.show { display: block; }
+        .config-section {
+            margin-top: 20px;
+        }
+        .config-section label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: #333;
+        }
+        .config-section input, .config-section textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 12px;
+        }
+        .config-section textarea {
+            height: 60px;
+            resize: vertical;
+        }
+        .config-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: #2d5a87;
+            color: white;
+        }
+        .btn-primary:hover:not(:disabled) {
+            background: #1e3a5f;
+            transform: translateY(-1px);
+        }
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        .btn-success:hover:not(:disabled) {
+            background: #218838;
+            transform: translateY(-1px);
+        }
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        .btn-secondary:hover:not(:disabled) {
+            background: #545b62;
+        }
+        .results-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            font-size: 13px;
+        }
+        .results-table th, .results-table td {
+            border: 1px solid #ddd;
+            padding: 8px 10px;
+            text-align: left;
+        }
+        .results-table th {
+            background: #2d5a87;
+            color: white;
+            font-weight: 600;
+        }
+        .results-table tr:nth-child(even) { background: #f8f9fa; }
+        .results-table tr:hover { background: #e8f0fe; }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        .badge-pass { background: #d4edda; color: #155724; }
+        .badge-fail { background: #f8d7da; color: #721c24; }
+        .badge-na { background: #fff3cd; color: #856404; }
+        .badge-pending { background: #d1ecf1; color: #0c5460; }
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .summary-card {
+            text-align: center;
+            padding: 15px;
+            border-radius: 8px;
+            background: #f8f9fa;
+        }
+        .summary-card .number {
+            font-size: 28px;
+            font-weight: 700;
+        }
+        .summary-card .label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 4px;
+        }
+        .summary-card.pass { border-left: 4px solid #28a745; }
+        .summary-card.pass .number { color: #28a745; }
+        .summary-card.fail { border-left: 4px solid #dc3545; }
+        .summary-card.fail .number { color: #dc3545; }
+        .summary-card.na { border-left: 4px solid #ffc107; }
+        .summary-card.na .number { color: #856404; }
+        .summary-card.total { border-left: 4px solid #2d5a87; }
+        .summary-card.total .number { color: #2d5a87; }
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e9ecef;
+            border-radius: 4px;
+            margin: 15px 0;
+            overflow: hidden;
+        }
+        .progress-bar .fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+        .progress-bar .fill.pass { background: #28a745; }
+        .hidden { display: none; }
+        .log-area {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+        .log-area .log-success { color: #4ec9b0; }
+        .log-area .log-error { color: #f44747; }
+        .log-area .log-info { color: #569cd6; }
+        @media (max-width: 768px) {
+            .config-grid { grid-template-columns: 1fr; }
+            .summary-cards { grid-template-columns: repeat(2, 1fr); }
+            .btn-group { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>QRIS UAT Document Generator</h1>
+            <p>Bank Sahabat Sampoerna - IT Quality Assurance</p>
+        </div>
+
+        <!-- Upload Section -->
+        <div class="card">
+            <h2>1. Upload UAT Script Excel</h2>
+            <div class="drop-zone" id="dropZone">
+                <div class="drop-zone-icon">📄</div>
+                <div class="drop-zone-text">
+                    <strong>Drag & Drop</strong> file UAT Script Excel (.xlsx) di sini<br>
+                    <small>atau klik untuk memilih file</small>
+                </div>
+            </div>
+            <div class="file-info" id="fileInfo"></div>
+            <input type="file" id="fileInput" accept=".xlsx,.xls" style="display:none">
+        </div>
+
+        <!-- Configuration Section -->
+        <div class="card" id="configCard" style="display:none">
+            <h2>2. Konfigurasi (Opsional)</h2>
+            <div class="config-grid">
+                <div>
+                    <label>Nama Penyedia Layanan:</label>
+                    <input type="text" id="namaPenyedia" value="Bank Sahabat Sampoerna">
+                </div>
+                <div>
+                    <label>Nama Pengguna Layanan:</label>
+                    <input type="text" id="namaPengguna" placeholder="Otomatis dari Excel">
+                </div>
+                <div>
+                    <label>Nama Layanan API:</label>
+                    <input type="text" id="namaLayanan" value="API QR MPM">
+                </div>
+                <div>
+                    <label>Tanggal Pengujian:</label>
+                    <input type="text" id="tanggalPengujian" placeholder="Otomatis dari Excel">
+                </div>
+            </div>
+            <div class="config-section">
+                <label>Skenario yang di-skip (pisahkan dengan koma):</label>
+                <textarea id="skippedScenarios" placeholder="Contoh: 18.8, 18.9, 18.10, 18.11, 18.12, 18.13, 18.14 (otomatis terdeteksi dari kolom Notes)"></textarea>
+            </div>
+        </div>
+
+        <!-- Preview & Results Section -->
+        <div class="card" id="resultsCard" style="display:none">
+            <h2>3. Hasil Validasi</h2>
+            <div class="summary-cards" id="summaryCards"></div>
+            <div class="progress-bar">
+                <div class="fill pass" id="progressFill" style="width: 0%"></div>
+            </div>
+            <div style="overflow-x: auto;">
+                <table class="results-table" id="resultsTable">
+                    <thead>
+                        <tr>
+                            <th>No</th>
+                            <th>Service</th>
+                            <th>Scenario</th>
+                            <th>Expected Code</th>
+                            <th>Actual Code</th>
+                            <th>Result</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsBody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Generate Section -->
+        <div class="card" id="generateCard" style="display:none">
+            <h2>4. Generate Dokumen</h2>
+            <p style="color:#666; margin-bottom:15px;">Klik tombol di bawah untuk generate dokumen .docx:</p>
+            <div class="btn-group">
+                <button class="btn btn-primary" id="btnUATResult" onclick="generateUATResult()">
+                    📋 Generate UAT Result
+                </button>
+                <button class="btn btn-success" id="btnLampiran7C" onclick="generateLampiran7C()">
+                    📑 Generate Lampiran 7C
+                </button>
+                <button class="btn btn-secondary" id="btnBoth" onclick="generateBoth()">
+                    📦 Generate Keduanya
+                </button>
+            </div>
+            <div class="log-area" id="logArea" style="display:none"></div>
+        </div>
+    </div>
+
+    <script>
+        // Check if libraries loaded properly
+        window.addEventListener('load', function() {
+            let errors = [];
+            if (typeof XLSX === 'undefined') errors.push('SheetJS (xlsx.js)');
+            if (typeof docx === 'undefined') errors.push('docx.js');
+            if (typeof saveAs === 'undefined') errors.push('FileSaver.js');
+
+            if (errors.length > 0) {
+                document.querySelector('.container').innerHTML = `
+                    <div class="card" style="text-align:center; margin-top:50px;">
+                        <h2 style="color:red;">Library Gagal Dimuat</h2>
+                        <p style="margin:15px 0;">Library berikut tidak bisa di-load:</p>
+                        <ul style="list-style:none; margin:10px 0;">${errors.map(e => '<li style="color:red; font-weight:bold;">- ' + e + '</li>').join('')}</ul>
+                        <p style="margin:15px 0; color:#666;">Kemungkinan penyebab:</p>
+                        <ul style="text-align:left; max-width:500px; margin:0 auto;">
+                            <li>Koneksi internet tidak tersedia</li>
+                            <li>Jaringan kantor memblokir CDN (cdnjs/unpkg)</li>
+                            <li>Firewall/proxy memblokir akses</li>
+                        </ul>
+                        <p style="margin-top:20px; font-weight:bold;">Solusi: Gunakan versi offline (Python + .bat)</p>
+                    </div>
+                `;
+            }
+        });
+    </script>
+    <script src="app.js"></script>
+</body>
+</html>
