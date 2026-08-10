@@ -441,13 +441,20 @@ class UATScriptParser:
         """Parse the UAT Script Excel file."""
         # Find the main sheet (first sheet or 'UAT Script')
         ws = self.wb.active
+        print(f"      -> Sheets tersedia: {self.wb.sheetnames}")
+        
         for name in self.wb.sheetnames:
             if 'uat' in name.lower() and 'script' in name.lower():
                 ws = self.wb[name]
                 break
-            elif 'script' in name.lower():
+            elif name.lower().strip() == 'uat script':
                 ws = self.wb[name]
                 break
+            elif 'script' in name.lower() and 'error' not in name.lower():
+                ws = self.wb[name]
+                break
+
+        print(f"      -> Menggunakan sheet: '{ws.title}' (max_row={ws.max_row}, max_col={ws.max_column})")
 
         # Extract metadata from header area
         self._extract_metadata(ws)
@@ -458,6 +465,17 @@ class UATScriptParser:
         if header_row is None:
             print("ERROR: Tidak dapat menemukan header row di Excel.")
             print("       Mencari kolom: Kategori, Nama Modul, Langkah Tes, dll.")
+            print("       Tips: Pastikan sheet yang benar dipilih dan header row ada.")
+            # Debug: show first 30 rows content
+            print("       DEBUG - Isi row 1-30:")
+            for r in range(1, min(31, ws.max_row + 1)):
+                vals = []
+                for c in range(1, min(12, ws.max_column + 1)):
+                    v = ws.cell(row=r, column=c).value
+                    if v:
+                        vals.append(f"C{c}:{str(v)[:30]}")
+                if vals:
+                    print(f"         Row {r}: {vals}")
             return [], self.metadata
 
         # Parse scenario rows
@@ -576,47 +594,85 @@ class UATScriptParser:
         """Find the header row and create column mapping."""
         col_map = {}
         
-        for row_idx in range(1, min(30, ws.max_row + 1)):
+        # Scan up to row 50 to find header (file may have lots of metadata at top)
+        for row_idx in range(1, min(50, ws.max_row + 1)):
             row_values = []
             for col_idx in range(1, ws.max_column + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
                 row_values.append(str(cell.value or '').strip().lower())
 
             # Check if this row contains expected column headers
-            has_kategori = any('kategori' in v for v in row_values)
-            has_nama_modul = any('nama modul' in v for v in row_values)
-            has_langkah = any('langkah' in v for v in row_values)
-            has_hasil = any('hasil' in v and 'diharapkan' in v for v in row_values)
+            # Use first line of each cell (cells may contain comment artifacts after \n)
+            first_lines = [v.split('\n')[0].strip() if v else '' for v in row_values]
+            
+            has_kategori = any('kategori' in fl for fl in first_lines)
+            has_nama_modul = any('nama modul' in fl for fl in first_lines)
+            has_langkah = any('langkah tes' in fl or fl == 'langkah tes' for fl in first_lines)
+            has_hasil = any('hasil' in fl and 'diharapkan' in fl for fl in first_lines)
+            has_nomor_kasus = any('nomor kasus' in fl or 'kasus tes' in fl for fl in first_lines)
 
-            if (has_kategori or has_nama_modul) and (has_langkah or has_hasil):
-                # Map columns
+            # Primary detection: must have "Langkah Tes" + at least one other
+            if has_langkah and (has_kategori or has_nama_modul or has_hasil or has_nomor_kasus):
+                # Map columns - check first line of cell value for header name
                 for idx, v in enumerate(row_values):
-                    if 'kategori' in v:
+                    # Get just the first line (before any newline/comment artifacts)
+                    first_line = v.split('\n')[0].strip() if v else ''
+                    
+                    if first_line == 'kategori' or (first_line.startswith('kategori') and 'nama' not in first_line):
                         col_map['kategori'] = idx
-                    elif 'nama modul' in v:
+                    elif 'nama modul' in first_line:
                         col_map['nama_modul'] = idx
-                    elif 'nomor skenario' in v or v == 'nomor skenario':
+                    elif 'nomor skenario' in first_line:
                         col_map['nomor_skenario'] = idx
-                    elif 'nomor kasus' in v or 'kasus tes' in v:
+                    elif 'nomor kasus' in first_line or 'kasus tes' in first_line:
                         col_map['nomor_kasus_tes'] = idx
-                    elif 'langkah' in v:
+                    elif 'langkah' in first_line:
                         col_map['langkah_tes'] = idx
-                    elif 'hasil' in v and 'diharapkan' in v:
+                    elif 'hasil' in first_line and 'diharapkan' in first_line:
                         col_map['hasil_diharapkan'] = idx
-                    elif 'hasil aktual' in v:
+                    elif 'hasil aktual' in first_line:
                         col_map['hasil_aktual'] = idx
-                    elif 'remark' in v:
+                    elif 'remark' in first_line:
                         col_map['remarks'] = idx
-                    elif 'tanggal' in v:
+                    elif 'tanggal' in first_line and 'pelaksanaan' in first_line:
                         col_map['tanggal'] = idx
-                    elif 'jenis' in v and 'script' in v:
+                    elif 'jenis' in first_line and 'script' in first_line:
                         col_map['jenis_script'] = idx
-                    elif 'pelaksana' in v:
+                    elif 'pelaksana' in first_line:
                         col_map['pelaksana'] = idx
 
+                print(f"      -> Header row ditemukan di baris {row_idx}")
+                print(f"      -> Kolom terdeteksi: {list(col_map.keys())}")
                 return row_idx, col_map
 
-        # Fallback - try simpler detection
+        # Fallback - try simpler detection (look for "Langkah Tes" anywhere)
+        for row_idx in range(1, min(50, ws.max_row + 1)):
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                val = str(cell.value or '').strip().lower()
+                if 'langkah tes' in val:
+                    # Found it - build col_map from this row
+                    for c in range(1, ws.max_column + 1):
+                        cv = str(ws.cell(row=row_idx, column=c).value or '').strip().lower()
+                        if 'kategori' in cv:
+                            col_map['kategori'] = c - 1
+                        elif 'nama modul' in cv:
+                            col_map['nama_modul'] = c - 1
+                        elif 'nomor skenario' in cv:
+                            col_map['nomor_skenario'] = c - 1
+                        elif 'nomor kasus' in cv or 'kasus tes' in cv:
+                            col_map['nomor_kasus_tes'] = c - 1
+                        elif 'langkah' in cv:
+                            col_map['langkah_tes'] = c - 1
+                        elif 'hasil' in cv and 'diharapkan' in cv:
+                            col_map['hasil_diharapkan'] = c - 1
+                        elif 'hasil aktual' in cv:
+                            col_map['hasil_aktual'] = c - 1
+                        elif 'remark' in cv:
+                            col_map['remarks'] = c - 1
+                    print(f"      -> Header row ditemukan (fallback) di baris {row_idx}")
+                    return row_idx, col_map
+
         return None, {}
 
     def _extract_aspi_number(self, langkah_tes):
