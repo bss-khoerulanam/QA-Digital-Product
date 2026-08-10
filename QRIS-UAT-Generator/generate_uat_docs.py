@@ -8,6 +8,12 @@ lalu menghasilkan:
 1. UAT Result (.docx) - Dokumen hasil pengujian detail
 2. Lampiran 7C (.docx) - Berita Acara untuk ASPI Portal
 
+Format input: UAT Script Excel dari mitra dengan kolom:
+- Kategori, Nama Modul, Nomor Skenario, Nomor Kasus Tes,
+  Langkah Tes, Hasil yang diharapkan, Hasil Aktual, Remarks
+
+Kolom Remarks berisi data request & response (URL, Headers, Body, Response)
+
 Author: IT QA BSS
 """
 
@@ -15,15 +21,14 @@ import re
 import sys
 import os
 from datetime import datetime
-from copy import deepcopy
 
 from openpyxl import load_workbook
 from docx import Document
-from docx.shared import Pt, Inches, Cm, RGBColor
+from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.section import WD_ORIENT
-from docx.oxml.ns import qn, nsdecls
+from docx.oxml.ns import nsdecls
 from docx.oxml import parse_xml
 
 
@@ -31,25 +36,394 @@ from docx.oxml import parse_xml
 # CONFIGURATION
 # =============================================================================
 
-# Skenario yang TIDAK digunakan (highlight kuning) - bisa dikustomisasi
-# Berdasarkan produk QRIS Merchant Aggregator BSS
-SKIPPED_SCENARIOS_DEFAULT = {
-    # Balance Services (semua di-skip untuk QRIS)
-    "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11",
-    # Transaction History (semua di-skip untuk QRIS)
-    "4.1", "4.2", "4.3", "4.4", "4.5", "4.6", "4.7", "4.8",
-}
-
 SKIP_REASON = "Tidak dites karena tidak sesuai dengan kondisi produk."
+
+# Status yang dianggap "tidak dites"
+SKIP_STATUSES = ["tidak dites", "tidak ditest"]
 
 
 
 # =============================================================================
-# EXCEL PARSER
+# REMARKS PARSER - Memisahkan URL, Headers, Request Body, Response
+# =============================================================================
+
+class RemarksParser:
+    """
+    Parse kolom Remarks dari UAT Script mitra.
+    
+    Format yang diharapkan di kolom Remarks:
+    
+    URL:
+    POST /snap-qris/v1.1/qr/qr-mpm-generate HTTP/1.1
+    Host: ob-sandbox.banksampoerna.co.id
+    ...
+    Headers:
+    Authorization: Bearer xxx
+    Content-Type: application/json
+    ...
+    Request Body:
+    {"field": "value", ...}
+    
+    Response:
+    HTTP/1.1 200
+    Content-Type: application/json
+    ...
+    {"responseCode":"2004700",...}
+    """
+
+    @staticmethod
+    def parse(remarks_text):
+        """
+        Parse remarks text into structured components.
+        Returns dict with keys: url, headers, request_body, response
+        """
+        result = {
+            "url": "",
+            "headers": "",
+            "request_body": "",
+            "response": "",
+            "full_request": "",  # Combined URL + Headers + Body for Lampiran 7C
+            "full_response": "", # Full response for Lampiran 7C
+        }
+
+        if not remarks_text or remarks_text.strip() == "":
+            return result
+
+        text = remarks_text.strip()
+
+        # Detect format variants from mitra
+        # Format 1: "URL:\n..." or "Request:\n..."
+        # Format 2: starts directly with "POST /..." or "GET /..."
+        # Format 3: Headers first (e.g., notification format)
+
+        # Try to split into Request and Response sections
+        request_part, response_part = RemarksParser._split_request_response(text)
+
+        # Parse request part
+        if request_part:
+            url, headers, body = RemarksParser._parse_request_section(request_part)
+            result["url"] = url
+            result["headers"] = headers
+            result["request_body"] = body
+            result["full_request"] = RemarksParser._format_request_output(url, headers, body)
+
+        # Parse response part
+        if response_part:
+            result["response"] = response_part.strip()
+            result["full_response"] = response_part.strip()
+
+        return result
+
+    @staticmethod
+    def _split_request_response(text):
+        """Split text into request and response sections."""
+        # Look for "Response:" or "Response:\n" separator
+        # Also handle "HTTP/1.1 XXX" as response start after a blank line
+        
+        # Pattern 1: Explicit "Response:" label
+        response_markers = [
+            r'\nResponse:\s*\n',
+            r'\nResponse:\s*$',
+            r'^Response:\s*\n',
+        ]
+        
+        for pattern in response_markers:
+            match = re.search(pattern, text, re.MULTILINE)
+            if match:
+                request_part = text[:match.start()].strip()
+                response_part = text[match.end():].strip()
+                return request_part, response_part
+
+        # Pattern 2: Look for HTTP response line after request body (JSON followed by HTTP/1.1)
+        # Find the boundary between request JSON and response HTTP status
+        json_then_http = re.search(
+            r'(\})\s*\n\s*\n*(HTTP/\d\.\d\s+\d+)',
+            text, re.MULTILINE
+        )
+        if json_then_http:
+            split_pos = json_then_http.start(2)
+            request_part = text[:split_pos].strip()
+            response_part = text[split_pos:].strip()
+            return request_part, response_part
+
+        # Pattern 3: No clear response section - treat entire text as request
+        # Check if text contains HTTP response pattern anywhere
+        http_response = re.search(r'\n(HTTP/\d\.\d\s+\d+\s*\n)', text)
+        if http_response:
+            request_part = text[:http_response.start()].strip()
+            response_part = text[http_response.start():].strip()
+            return request_part, response_part
+
+        # No response found - everything is request (e.g., notification scenario)
+        return text, ""
+
+    @staticmethod
+    def _parse_request_section(request_text):
+        """Parse request section into URL, Headers, and Body."""
+        url = ""
+        headers = ""
+        body = ""
+
+        lines = request_text.split('\n')
+        
+        # Remove leading labels like "URL:", "Request:"
+        start_idx = 0
+        if lines and re.match(r'^(URL|Request)\s*:\s*$', lines[0].strip(), re.IGNORECASE):
+            start_idx = 1
+        
+        # Find HTTP method line (POST /path HTTP/1.1 or GET /path HTTP/1.1)
+        http_method_idx = -1
+        for i in range(start_idx, len(lines)):
+            if re.match(r'^(POST|GET|PUT|DELETE|PATCH)\s+/', lines[i].strip()):
+                http_method_idx = i
+                break
+
+        if http_method_idx >= 0:
+            # URL is the HTTP method line
+            url_line = lines[http_method_idx].strip()
+            
+            # Find Host header to construct full URL
+            host = ""
+            for i in range(http_method_idx + 1, len(lines)):
+                if lines[i].strip().lower().startswith('host:'):
+                    host = lines[i].strip().split(':', 1)[1].strip()
+                    break
+
+            # Extract method and path from "POST /path HTTP/1.1"
+            method_match = re.match(r'(POST|GET|PUT|DELETE|PATCH)\s+(\S+)', url_line)
+            if method_match and host:
+                method = method_match.group(1)
+                path = method_match.group(2)
+                url = f"URL:\n{method} https://{host}{path}"
+            else:
+                url = f"URL:\n{url_line}"
+
+            # Find where headers end and body begins
+            # Headers are after HTTP line, body starts after empty line or "Request Body:" label
+            header_lines = []
+            body_start_idx = -1
+            
+            # Check for explicit "Headers:" label
+            headers_label_idx = -1
+            request_body_label_idx = -1
+            
+            for i in range(http_method_idx + 1, len(lines)):
+                line = lines[i].strip()
+                if re.match(r'^Headers?\s*:\s*$', line, re.IGNORECASE):
+                    headers_label_idx = i
+                elif re.match(r'^Request\s*Body\s*:\s*$', line, re.IGNORECASE):
+                    request_body_label_idx = i
+                    break
+
+            if headers_label_idx >= 0 and request_body_label_idx >= 0:
+                # Explicit labels found
+                header_lines = lines[headers_label_idx + 1:request_body_label_idx]
+                body_lines = lines[request_body_label_idx + 1:]
+                body = '\n'.join(body_lines).strip()
+            else:
+                # No explicit labels - parse by content
+                # Headers are key: value pairs after Host line
+                # Body is JSON content (starts with {)
+                in_headers = True
+                for i in range(http_method_idx + 1, len(lines)):
+                    line = lines[i].strip()
+                    
+                    # Skip Host line (already captured in URL)
+                    if line.lower().startswith('host:'):
+                        continue
+                    
+                    # Skip labels
+                    if re.match(r'^(Headers?|Request\s*Body)\s*:\s*$', line, re.IGNORECASE):
+                        if 'body' in line.lower():
+                            in_headers = False
+                        continue
+                    
+                    if in_headers:
+                        # Check if this line looks like a header (Key: Value)
+                        if re.match(r'^[\w-]+\s*:', line) and not line.startswith('{'):
+                            header_lines.append(lines[i])
+                        elif line.startswith('{') or line == '':
+                            in_headers = False
+                            if line.startswith('{'):
+                                body = '\n'.join(l for l in lines[i:]).strip()
+                                # But body might include response - trim at response
+                                break
+                    
+            headers = '\n'.join(l.strip() for l in header_lines if l.strip()).strip()
+            
+            # Clean body - remove trailing non-JSON content
+            if body:
+                # Find the end of JSON in body
+                brace_count = 0
+                json_end = -1
+                for i, ch in enumerate(body):
+                    if ch == '{':
+                        brace_count += 1
+                    elif ch == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                if json_end > 0:
+                    body = body[:json_end]
+
+        else:
+            # No HTTP method line found - might be notification format
+            # (starts directly with headers like Authorization:, Content-Type:, etc.)
+            header_lines = []
+            body_start = -1
+            
+            for i in range(start_idx, len(lines)):
+                line = lines[i].strip()
+                if line.startswith('{'):
+                    body_start = i
+                    break
+                elif re.match(r'^[\w-]+\s*:', line):
+                    header_lines.append(line)
+
+            headers = '\n'.join(header_lines).strip()
+            if body_start >= 0:
+                body_text = '\n'.join(lines[body_start:]).strip()
+                # Find end of JSON
+                brace_count = 0
+                json_end = -1
+                for i, ch in enumerate(body_text):
+                    if ch == '{':
+                        brace_count += 1
+                    elif ch == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                if json_end > 0:
+                    body = body_text[:json_end]
+                else:
+                    body = body_text
+
+        return url, headers, body
+
+    @staticmethod
+    def _format_request_output(url, headers, body):
+        """Format request for Lampiran 7C output column."""
+        parts = []
+        if url:
+            parts.append(url)
+        if headers:
+            parts.append(f"\nHeaders:\n{headers}")
+        if body:
+            parts.append(f"\nRequest Body:\n{body}")
+        return '\n'.join(parts).strip()
+
+
+
+# =============================================================================
+# RESPONSE PARSER - Extract response body/JSON from full HTTP response
+# =============================================================================
+
+class ResponseParser:
+    """Parse full HTTP response to extract just the response body."""
+
+    @staticmethod
+    def extract_response_body(response_text):
+        """
+        Extract JSON response body from full HTTP response.
+        Input: Full HTTP response including status line and headers
+        Output: Just the JSON body
+        """
+        if not response_text:
+            return ""
+
+        # If it's already just JSON, return as-is
+        stripped = response_text.strip()
+        if stripped.startswith('{'):
+            return stripped
+
+        # Find JSON body in the response (last JSON object)
+        lines = stripped.split('\n')
+        json_start = -1
+        for i, line in enumerate(lines):
+            if line.strip().startswith('{'):
+                json_start = i
+                break
+
+        if json_start >= 0:
+            json_text = '\n'.join(lines[json_start:]).strip()
+            # Find end of JSON
+            brace_count = 0
+            json_end = -1
+            for i, ch in enumerate(json_text):
+                if ch == '{':
+                    brace_count += 1
+                elif ch == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+            if json_end > 0:
+                return json_text[:json_end]
+            return json_text
+
+        return response_text
+
+    @staticmethod
+    def extract_response_code(response_text):
+        """Extract responseCode from response text."""
+        if not response_text:
+            return None
+        patterns = [
+            r'"responseCode"\s*:\s*"(\d+)"',
+            r'"responseCode"\s*:\s*(\d+)',
+            r'responseCode.*?(\d{7})',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, response_text)
+            if match:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def format_response_output(response_text):
+        """Format response for Lampiran 7C output - show full response."""
+        if not response_text:
+            return ""
+        return response_text.strip()
+
+
+
+# =============================================================================
+# EXCEL PARSER - Handles real mitra UAT Script format
 # =============================================================================
 
 class UATScriptParser:
-    """Parser untuk membaca UAT Script Excel yang diisi mitra."""
+    """
+    Parser untuk membaca UAT Script Excel yang diisi mitra.
+    
+    Kolom yang diharapkan:
+    - Kategori
+    - Nama Modul
+    - Nomor Skenario
+    - Nomor Kasus Tes
+    - Langkah Tes
+    - Hasil yang diharapkan
+    - Hasil Aktual
+    - Remarks (berisi URL, Headers, Body, Response)
+    - Tanggal Pelaksanaan (opsional)
+    - Jenis Script (opsional)
+    - Pelaksana (opsional)
+    """
+
+    # Column mapping - will be detected dynamically
+    COL_KATEGORI = 0
+    COL_NAMA_MODUL = 1
+    COL_NOMOR_SKENARIO = 2
+    COL_NOMOR_KASUS_TES = 3
+    COL_LANGKAH_TES = 4
+    COL_HASIL_DIHARAPKAN = 5
+    COL_HASIL_AKTUAL = 6
+    COL_REMARKS = 7
+    COL_TANGGAL = 8
+    COL_JENIS_SCRIPT = 9
+    COL_PELAKSANA = 10
 
     def __init__(self, excel_path):
         self.excel_path = excel_path
@@ -60,80 +434,201 @@ class UATScriptParser:
             "nama_layanan": "API QR MPM",
             "nama_pengguna": "",
             "tanggal_pengujian": "",
+            "nomor_referensi": "",
         }
 
     def parse(self):
         """Parse the UAT Script Excel file."""
+        # Find the main sheet (first sheet or 'UAT Script')
         ws = self.wb.active
-
-        # Try to extract metadata from header rows
-        for row in ws.iter_rows(min_row=1, max_row=6, values_only=False):
-            for cell in row:
-                if cell.value and isinstance(cell.value, str):
-                    if "Nama Penyedia" in cell.value:
-                        # Get value from next cell or same cell after colon
-                        val = self._extract_value(cell, row, ws)
-                        if val:
-                            self.metadata["nama_penyedia"] = val
-                    elif "Nama Layanan" in cell.value:
-                        val = self._extract_value(cell, row, ws)
-                        if val:
-                            self.metadata["nama_layanan"] = val
-                    elif "Nama Pengguna" in cell.value:
-                        val = self._extract_value(cell, row, ws)
-                        if val:
-                            self.metadata["nama_pengguna"] = val
-                    elif "Tanggal" in cell.value:
-                        val = self._extract_value(cell, row, ws)
-                        if val:
-                            self.metadata["tanggal_pengujian"] = str(val)
-
-        # Find header row (contains "No", "Service", "Scenario", etc.)
-        header_row = None
-        for row_idx, row in enumerate(ws.iter_rows(min_row=1, values_only=True), 1):
-            row_values = [str(c).strip().lower() if c else "" for c in row]
-            if "no" in row_values and "service" in row_values:
-                header_row = row_idx
+        for name in self.wb.sheetnames:
+            if 'uat' in name.lower() and 'script' in name.lower():
+                ws = self.wb[name]
+                break
+            elif 'script' in name.lower():
+                ws = self.wb[name]
                 break
 
-        if not header_row:
+        # Extract metadata from header area
+        self._extract_metadata(ws)
+
+        # Find the header row with column names
+        header_row, col_map = self._find_header_row(ws)
+
+        if header_row is None:
             print("ERROR: Tidak dapat menemukan header row di Excel.")
-            return
+            print("       Mencari kolom: Kategori, Nama Modul, Langkah Tes, dll.")
+            return [], self.metadata
 
         # Parse scenario rows
-        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
-            no = row[0] if len(row) > 0 else None
-            if no is None or str(no).strip() == "":
+        current_section = ""
+        for row_idx in range(header_row + 1, ws.max_row + 1):
+            row_data = []
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                row_data.append(cell.value)
+
+            # Skip completely empty rows
+            if all(v is None or str(v).strip() == "" for v in row_data):
                 continue
 
+            # Detect section headers (e.g., "Balance Services", "QR MPM", etc.)
+            first_col = str(row_data[col_map.get('kategori', 0)] or '').strip()
+            second_col = str(row_data[col_map.get('nama_modul', 1)] or '').strip()
+            
+            # Section header detection - row with bold section name
+            section_keywords = [
+                "Balance Services", "API Transaction History",
+                "QR MPM", "PENGECEKAN MUTASI", "Generate QR SNAP",
+                "Refund Payment", "Query Payment", "Inquiry"
+            ]
+            
+            is_section_header = False
+            for kw in section_keywords:
+                if kw.lower() in first_col.lower() or kw.lower() in second_col.lower():
+                    # Check if this row has no test case data
+                    langkah = row_data[col_map.get('langkah_tes', 4)] if col_map.get('langkah_tes', 4) < len(row_data) else None
+                    if not langkah or str(langkah).strip() == "":
+                        current_section = first_col or second_col
+                        is_section_header = True
+                        break
+
+            if is_section_header:
+                continue
+
+            # Parse scenario row
+            nomor_kasus = str(row_data[col_map.get('nomor_kasus_tes', 3)] or '').strip()
+            langkah_tes = str(row_data[col_map.get('langkah_tes', 4)] or '').strip()
+
+            # Skip rows without test case number or step
+            if not nomor_kasus and not langkah_tes:
+                continue
+
+            # Get actual result and remarks
+            hasil_aktual = str(row_data[col_map.get('hasil_aktual', 6)] or '').strip()
+            remarks_raw = str(row_data[col_map.get('remarks', 7)] or '').strip()
+
+            # Determine ASPI scenario number from Langkah Tes
+            # Format: "18,1 Access Token Invalid" -> extract "18.1"
+            aspi_no = self._extract_aspi_number(langkah_tes)
+
+            # Parse remarks to extract request/response
+            parsed_remarks = RemarksParser.parse(remarks_raw)
+
             scenario = {
-                "no": str(row[0]).strip() if row[0] else "",
-                "service": str(row[1]).strip() if len(row) > 1 and row[1] else "",
-                "scenario": str(row[2]).strip() if len(row) > 2 and row[2] else "",
-                "expected_result": str(row[3]).strip() if len(row) > 3 and row[3] else "",
-                "request": str(row[4]).strip() if len(row) > 4 and row[4] else "",
-                "response": str(row[5]).strip() if len(row) > 5 and row[5] else "",
-                "result": str(row[6]).strip() if len(row) > 6 and row[6] else "",
-                "notes": str(row[7]).strip() if len(row) > 7 and row[7] else "",
+                "section": current_section,
+                "kategori": first_col,
+                "nama_modul": str(row_data[col_map.get('nama_modul', 1)] or '').strip(),
+                "nomor_skenario": str(row_data[col_map.get('nomor_skenario', 2)] or '').strip(),
+                "nomor_kasus_tes": nomor_kasus,
+                "langkah_tes": langkah_tes,
+                "aspi_no": aspi_no,
+                "expected_result": str(row_data[col_map.get('hasil_diharapkan', 5)] or '').strip(),
+                "hasil_aktual": hasil_aktual,
+                "remarks_raw": remarks_raw,
+                # Parsed request/response
+                "url": parsed_remarks["url"],
+                "headers": parsed_remarks["headers"],
+                "request_body": parsed_remarks["request_body"],
+                "request": parsed_remarks["full_request"],
+                "response": parsed_remarks["full_response"],
+                # For validation
+                "is_skipped": hasil_aktual.lower() in SKIP_STATUSES,
+                "is_tested": hasil_aktual.lower() == "berhasil" or 
+                            (remarks_raw != "" and hasil_aktual.lower() not in SKIP_STATUSES),
             }
+
             self.scenarios.append(scenario)
 
+        print(f"      -> Parsed {len(self.scenarios)} skenario")
         return self.scenarios, self.metadata
 
+    def _extract_metadata(self, ws):
+        """Extract metadata from header rows."""
+        for row_idx in range(1, min(20, ws.max_row + 1)):
+            for col_idx in range(1, min(15, ws.max_column + 1)):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if cell.value and isinstance(cell.value, str):
+                    val = cell.value.strip()
+                    
+                    # Look for project name in angle brackets
+                    if '<' in val and '>' in val:
+                        match = re.search(r'<(.+?)>', val)
+                        if match:
+                            project_name = match.group(1)
+                            # Extract mitra name from project name
+                            # e.g., "Penambahan Layanan QRIS Merchant Aggregator PT Sender Integrasi Digital (Kirimo)"
+                            mitra_match = re.search(r'((?:PT|CV)\s+[\w\s]+(?:\([^)]+\))?)', project_name)
+                            if mitra_match:
+                                self.metadata["nama_pengguna"] = mitra_match.group(0).strip()
+                    
+                    if "Nomor Referensi" in val:
+                        next_cell = ws.cell(row=row_idx, column=col_idx + 1)
+                        if next_cell.value:
+                            self.metadata["nomor_referensi"] = str(next_cell.value).strip()
+                    
+                    if "Tanggal" in val and "Pelaksanaan" not in val:
+                        next_cell = ws.cell(row=row_idx, column=col_idx + 1)
+                        if next_cell.value:
+                            self.metadata["tanggal_pengujian"] = str(next_cell.value).strip()
 
-    def _extract_value(self, cell, row, ws):
-        """Extract value from cell - handles 'Label: Value' or adjacent cell."""
-        val = cell.value
-        if ":" in str(val):
-            parts = str(val).split(":", 1)
-            if len(parts) > 1 and parts[1].strip():
-                return parts[1].strip()
-        # Try next column
-        col_idx = cell.column
-        next_cell = ws.cell(row=cell.row, column=col_idx + 1)
-        if next_cell.value:
-            return str(next_cell.value).strip()
-        return None
+    def _find_header_row(self, ws):
+        """Find the header row and create column mapping."""
+        col_map = {}
+        
+        for row_idx in range(1, min(30, ws.max_row + 1)):
+            row_values = []
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                row_values.append(str(cell.value or '').strip().lower())
+
+            # Check if this row contains expected column headers
+            has_kategori = any('kategori' in v for v in row_values)
+            has_nama_modul = any('nama modul' in v for v in row_values)
+            has_langkah = any('langkah' in v for v in row_values)
+            has_hasil = any('hasil' in v and 'diharapkan' in v for v in row_values)
+
+            if (has_kategori or has_nama_modul) and (has_langkah or has_hasil):
+                # Map columns
+                for idx, v in enumerate(row_values):
+                    if 'kategori' in v:
+                        col_map['kategori'] = idx
+                    elif 'nama modul' in v:
+                        col_map['nama_modul'] = idx
+                    elif 'nomor skenario' in v or v == 'nomor skenario':
+                        col_map['nomor_skenario'] = idx
+                    elif 'nomor kasus' in v or 'kasus tes' in v:
+                        col_map['nomor_kasus_tes'] = idx
+                    elif 'langkah' in v:
+                        col_map['langkah_tes'] = idx
+                    elif 'hasil' in v and 'diharapkan' in v:
+                        col_map['hasil_diharapkan'] = idx
+                    elif 'hasil aktual' in v:
+                        col_map['hasil_aktual'] = idx
+                    elif 'remark' in v:
+                        col_map['remarks'] = idx
+                    elif 'tanggal' in v:
+                        col_map['tanggal'] = idx
+                    elif 'jenis' in v and 'script' in v:
+                        col_map['jenis_script'] = idx
+                    elif 'pelaksana' in v:
+                        col_map['pelaksana'] = idx
+
+                return row_idx, col_map
+
+        # Fallback - try simpler detection
+        return None, {}
+
+    def _extract_aspi_number(self, langkah_tes):
+        """Extract ASPI scenario number from Langkah Tes field."""
+        if not langkah_tes:
+            return ""
+        # Match patterns like "18,1" or "18.1" at the beginning
+        match = re.match(r'(\d+)[,.](\d+)', langkah_tes)
+        if match:
+            return f"{match.group(1)}.{match.group(2)}"
+        return ""
+
 
 
 # =============================================================================
@@ -144,30 +639,10 @@ class ResultValidator:
     """Validasi hasil berdasarkan response code vs expected result."""
 
     @staticmethod
-    def extract_response_code(response_text):
-        """Extract response/error code from response text."""
-        if not response_text:
-            return None
-        # Match patterns like "responseCode": "2004700" or responseCode: 2004700
-        patterns = [
-            r'"responseCode"\s*:\s*"(\d+)"',
-            r'"httpCode"\s*:\s*(\d+)',
-            r'"responseCode"\s*:\s*(\d+)',
-            r'responseCode.*?(\d{7})',
-            r'[Cc]ode.*?(\d{7})',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, response_text)
-            if match:
-                return match.group(1)
-        return None
-
-    @staticmethod
     def extract_expected_code(expected_text):
         """Extract expected response/error code from expected result text."""
         if not expected_text:
             return None
-        # Match patterns like "Response Code: 2004700" or "Error Code: 4044708"
         patterns = [
             r'[Rr]esponse\s*[Cc]ode[:\s]*(\d{7})',
             r'[Ee]rror\s*[Cc]ode[:\s]*(\d+xx\d+)',
@@ -185,25 +660,32 @@ class ResultValidator:
     def validate(scenario):
         """
         Validate if response matches expected result.
-        Returns: 'PASS', 'NOT PASS', 'N/A', or 'NOT TESTED'
+        Kriteria: responseCode di response HARUS sama dengan expected result.
+        Returns: 'PASS', 'NOT PASS', 'N/A', atau 'NOT TESTED'
         """
-        # If already filled by mitra
-        if scenario.get("result") and scenario["result"].upper() in ["PASS", "NOT PASS", "N/A"]:
-            return scenario["result"].upper()
+        # If skipped
+        if scenario.get("is_skipped"):
+            return "N/A"
 
-        # If no response provided, it's not tested
-        if not scenario.get("response") or scenario["response"] in ["None", "", "Response Body:"]:
+        # If no response data
+        if not scenario.get("response") or scenario["response"].strip() == "":
+            # Check if hasil_aktual says "Berhasil"
+            if scenario.get("hasil_aktual", "").lower() == "berhasil":
+                return "NOT TESTED"  # Has result but no evidence
             return "NOT TESTED"
 
+        # Extract codes
         expected_code = ResultValidator.extract_expected_code(scenario.get("expected_result", ""))
-        actual_code = ResultValidator.extract_response_code(scenario.get("response", ""))
+        actual_code = ResponseParser.extract_response_code(scenario.get("response", ""))
 
         if not expected_code or not actual_code:
+            # Can't validate - check hasil_aktual
+            if scenario.get("hasil_aktual", "").lower() == "berhasil":
+                return "PASS"
             return "NOT TESTED"
 
         # Handle xx pattern (e.g., 401xx01)
         if "xx" in expected_code:
-            # Convert pattern like 401xx01 to regex
             pattern = expected_code.replace("xx", r"\d{2}")
             if re.match(pattern, actual_code):
                 return "PASS"
@@ -228,7 +710,7 @@ def set_cell_shading(cell, color):
     cell._tc.get_or_add_tcPr().append(shading_elm)
 
 
-def set_cell_border(cell, **kwargs):
+def set_cell_border(cell):
     """Set border for a table cell."""
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
@@ -243,293 +725,30 @@ def set_cell_border(cell, **kwargs):
     tcPr.append(tcBorders)
 
 
-def add_formatted_text(paragraph, text, bold=False, size=Pt(10)):
-    """Add formatted run to paragraph."""
-    run = paragraph.add_run(text)
-    run.bold = bold
-    run.font.size = size
-    return run
-
-
 def create_table_with_borders(doc, rows, cols):
     """Create a table with all borders."""
     table = doc.add_table(rows=rows, cols=cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    # Set borders for all cells
     for row in table.rows:
         for cell in row.cells:
             set_cell_border(cell)
     return table
 
 
-
-# =============================================================================
-# UAT RESULT DOCUMENT GENERATOR
-# =============================================================================
-
-class UATResultGenerator:
-    """Generate UAT Result document (.docx)."""
-
-    def __init__(self, scenarios, metadata, skipped_scenarios=None):
-        self.scenarios = scenarios
-        self.metadata = metadata
-        self.skipped = skipped_scenarios or set()
-        self.doc = Document()
-        self.validator = ResultValidator()
-
-    def generate(self, output_path):
-        """Generate the UAT Result document."""
-        self._set_styles()
-        self._add_title_page()
-        self._add_table_of_contents()
-        self._add_qr_mpm_section()
-        self._add_pengecekan_mutasi_section()
-        self._add_summary()
-
-        self.doc.save(output_path)
-        print(f"[OK] UAT Result saved: {output_path}")
-
-    def _set_styles(self):
-        """Set default document styles."""
-        style = self.doc.styles['Normal']
-        font = style.font
-        font.name = 'Calibri'
-        font.size = Pt(10)
-
-    def _add_title_page(self):
-        """Add title page."""
-        # Add some spacing
-        for _ in range(3):
-            self.doc.add_paragraph()
-
-        title = self.doc.add_paragraph()
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title.add_run("UAT Result")
-        run.bold = True
-        run.font.size = Pt(24)
-
-        self.doc.add_paragraph()
-
-        subtitle = self.doc.add_paragraph()
-        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = subtitle.add_run("Penambahan Layanan QRIS Merchant Aggregator")
-        run.bold = True
-        run.font.size = Pt(16)
-
-        self.doc.add_paragraph()
-
-        # Metadata
-        info = self.doc.add_paragraph()
-        info.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        info.add_run(f"Nama Penyedia Layanan: {self.metadata.get('nama_penyedia', '')}").font.size = Pt(11)
-        info.add_run("\n")
-        info.add_run(f"Nama Pengguna Layanan: {self.metadata.get('nama_pengguna', '')}").font.size = Pt(11)
-        info.add_run("\n")
-        info.add_run(f"Tanggal Pengujian: {self.metadata.get('tanggal_pengujian', '')}").font.size = Pt(11)
-
-        self.doc.add_page_break()
-
-
-    def _add_table_of_contents(self):
-        """Add table of contents."""
-        heading = self.doc.add_heading("Daftar Isi", level=1)
-
-        # Group scenarios by service
-        toc_items = []
-        current_section = ""
-        section_num = 0
-
-        # Section 1 & 2: Balance & Transaction History (all skipped)
-        toc_items.append(("1", "Balance Services", []))
-        toc_items.append(("2", "API Transaction History List", []))
-
-        # Section 3: QR MPM
-        qr_scenarios = []
-        for s in self.scenarios:
-            if s["no"].startswith("18."):
-                qr_scenarios.append(s)
-        toc_items.append(("3", "QR MPM", qr_scenarios))
-
-        # Section 4+: Additional sections
-        toc_items.append(("4", "Pengecekan Mutasi Dan Jurnal", []))
-        toc_items.append(("5", "Generate QR SNAP", []))
-        toc_items.append(("6", "Refund Payment", []))
-        toc_items.append(("7", "Query Payment", []))
-        toc_items.append(("8", "Inquiry & Report", []))
-
-        for section_id, section_name, _ in toc_items:
-            p = self.doc.add_paragraph()
-            p.paragraph_format.left_indent = Cm(1)
-            p.add_run(f"{section_id}  {section_name}").font.size = Pt(10)
-
-        self.doc.add_page_break()
-
-    def _add_section_header(self, level, number, title):
-        """Add a section header."""
-        heading = self.doc.add_heading(f"{number} {title}", level=level)
-        return heading
-
-
-    def _add_skipped_section(self, section_num, section_title, scenarios_info):
-        """Add a section that is entirely skipped."""
-        self._add_section_header(1, str(section_num), section_title)
-        for idx, (sub_no, scenario_name) in enumerate(scenarios_info, 1):
-            self._add_section_header(2, f"{section_num}.{idx}", f"{sub_no} {scenario_name}")
-            p = self.doc.add_paragraph()
-            p.add_run(SKIP_REASON).italic = True
-
-    def _add_qr_mpm_section(self):
-        """Add QR MPM section with actual test results."""
-        self._add_section_header(1, "3", "QR MPM")
-
-        # Define which scenarios are used (not highlighted yellow)
-        # Based on the UAT Result template, these are tested:
-        # 18.1-18.7: General + Generate QR (tested)
-        # 18.8-18.14: Decode QR, Payment Redirect, Apply OTT, Payment H2H (skipped based on mode)
-        # 18.15-18.17: Query Payment (tested)
-        # 18.18-18.19: Payment Notification (tested)
-
-        sub_idx = 1
-        for scenario in self.scenarios:
-            no = scenario["no"]
-            if not no.startswith("18."):
-                continue
-
-            self._add_section_header(2, f"3.{sub_idx}", f"{no} {scenario['scenario']}")
-
-            # Check if this scenario is in the skip list
-            is_skipped = self._is_scenario_skipped(scenario)
-
-            if is_skipped:
-                p = self.doc.add_paragraph()
-                p.add_run(SKIP_REASON).italic = True
-            else:
-                self._add_scenario_detail(scenario)
-
-            sub_idx += 1
-
-    def _is_scenario_skipped(self, scenario):
-        """Determine if a scenario should be marked as skipped."""
-        no = scenario["no"]
-        # If result is empty and no request/response filled
-        if (not scenario.get("request") or scenario["request"] in ["None", "", "URL Endpoint:\nHeader Request:\nRequest Body:"]) \
-           and (not scenario.get("response") or scenario["response"] in ["None", "", "Response Body:"]):
-            # Check notes
-            if scenario.get("notes") and "tidak" in scenario["notes"].lower():
-                return True
-            # Check if in predefined skip list
-            if no in self.skipped:
-                return True
-        return False
-
-
-    def _add_scenario_detail(self, scenario):
-        """Add detailed scenario result with request/response."""
-        # Expected Result
-        p = self.doc.add_paragraph()
-        p.add_run("Expected Result: ").bold = True
-        p.add_run(scenario.get("expected_result", ""))
-
-        # Request
-        p = self.doc.add_paragraph()
-        p.add_run("Request:").bold = True
-        self.doc.add_paragraph()
-        req_text = scenario.get("request", "")
-        if req_text and req_text not in ["None", ""]:
-            # Parse and display request
-            self._add_code_block(req_text)
-
-        # Response
-        p = self.doc.add_paragraph()
-        p.add_run("Response:").bold = True
-        self.doc.add_paragraph()
-        resp_text = scenario.get("response", "")
-        if resp_text and resp_text not in ["None", ""]:
-            self._add_code_block(resp_text)
-
-        # Result (PASS/NOT PASS)
-        result = self.validator.validate(scenario)
-        p = self.doc.add_paragraph()
-        p.add_run("Result: ").bold = True
-        result_run = p.add_run(result)
-        if result == "PASS":
-            result_run.font.color.rgb = RGBColor(0, 128, 0)  # Green
-        elif result == "NOT PASS":
-            result_run.font.color.rgb = RGBColor(255, 0, 0)  # Red
-        result_run.bold = True
-
-        # Notes
-        if scenario.get("notes") and scenario["notes"] not in ["None", ""]:
-            p = self.doc.add_paragraph()
-            p.add_run("Notes: ").bold = True
-            p.add_run(scenario["notes"])
-
-        self.doc.add_paragraph()  # spacing
-
-    def _add_code_block(self, text):
-        """Add a code block style text."""
-        p = self.doc.add_paragraph()
-        p.paragraph_format.left_indent = Cm(1)
-        run = p.add_run(text)
-        run.font.name = 'Consolas'
-        run.font.size = Pt(8)
-
-
-    def _add_pengecekan_mutasi_section(self):
-        """Add Pengecekan Mutasi Dan Jurnal section."""
-        self._add_section_header(1, "4", "Pengecekan Mutasi Dan Jurnal")
-        p = self.doc.add_paragraph()
-        p.add_run("Hasil pengecekan mutasi dan jurnal akan dilampirkan terpisah.")
-
-    def _add_summary(self):
-        """Add summary of test results."""
-        self.doc.add_page_break()
-        self._add_section_header(1, "", "Ringkasan Hasil Pengujian")
-
-        total = 0
-        passed = 0
-        failed = 0
-        skipped = 0
-        not_tested = 0
-
-        for s in self.scenarios:
-            total += 1
-            result = self.validator.validate(s)
-            if self._is_scenario_skipped(s):
-                skipped += 1
-            elif result == "PASS":
-                passed += 1
-            elif result == "NOT PASS":
-                failed += 1
-            else:
-                not_tested += 1
-
-        # Summary table
-        table = create_table_with_borders(self.doc, 6, 2)
-        table.columns[0].width = Cm(8)
-        table.columns[1].width = Cm(4)
-
-        data = [
-            ("Kategori", "Jumlah"),
-            ("Total Skenario", str(total)),
-            ("PASS", str(passed)),
-            ("NOT PASS", str(failed)),
-            ("Tidak Diuji (N/A)", str(skipped)),
-            ("Belum Diisi", str(not_tested)),
-        ]
-
-        for i, (label, value) in enumerate(data):
-            table.rows[i].cells[0].text = label
-            table.rows[i].cells[1].text = value
-            if i == 0:
-                set_cell_shading(table.rows[i].cells[0], "4472C4")
-                set_cell_shading(table.rows[i].cells[1], "4472C4")
-                for cell in table.rows[i].cells:
-                    for paragraph in cell.paragraphs:
-                        for run in paragraph.runs:
-                            run.font.color.rgb = RGBColor(255, 255, 255)
-                            run.bold = True
+def add_cell_text(cell, text, font_name='Calibri', font_size=Pt(8),
+                  bold=False, color=None, alignment=None):
+    """Add formatted text to a table cell."""
+    cell.text = ""
+    p = cell.paragraphs[0]
+    if alignment:
+        p.alignment = alignment
+    run = p.add_run(str(text) if text else "")
+    run.font.name = font_name
+    run.font.size = font_size
+    run.bold = bold
+    if color:
+        run.font.color.rgb = color
+    return run
 
 
 
@@ -538,12 +757,30 @@ class UATResultGenerator:
 # =============================================================================
 
 class Lampiran7CGenerator:
-    """Generate Lampiran 7C - Berita Acara for ASPI Portal (.docx)."""
+    """
+    Generate Lampiran 7C - Berita Acara for ASPI Portal (.docx).
+    
+    Format output sesuai template ASPI:
+    Kolom: No | Service | Scenario | Expected Result | Request | Response | Result | Notes
+    
+    Kolom Request berisi:
+        URL:
+        [method] [full_url]
+        
+        Headers:
+        [header lines]
+        
+        Request Body:
+        [JSON body]
+    
+    Kolom Response berisi:
+        Response:
+        [full HTTP response with headers and body]
+    """
 
-    def __init__(self, scenarios, metadata, skipped_scenarios=None):
+    def __init__(self, scenarios, metadata):
         self.scenarios = scenarios
         self.metadata = metadata
-        self.skipped = skipped_scenarios or set()
         self.doc = Document()
         self.validator = ResultValidator()
 
@@ -567,10 +804,10 @@ class Lampiran7CGenerator:
         # Set page to landscape for table readability
         section = self.doc.sections[0]
         section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_width = Cm(29.7)
-        section.page_height = Cm(21.0)
-        section.left_margin = Cm(1.5)
-        section.right_margin = Cm(1.5)
+        section.page_width = Cm(42.0)  # A3 width for wide table
+        section.page_height = Cm(29.7)
+        section.left_margin = Cm(1.0)
+        section.right_margin = Cm(1.0)
         section.top_margin = Cm(1.5)
         section.bottom_margin = Cm(1.5)
 
@@ -590,7 +827,7 @@ class Lampiran7CGenerator:
 
         self.doc.add_paragraph()
 
-        # Metadata info
+        # Metadata
         meta_items = [
             ("Nama Penyedia Layanan", self.metadata.get("nama_penyedia", "Bank Sahabat Sampoerna")),
             ("Nama Pengguna Layanan", self.metadata.get("nama_pengguna", "")),
@@ -601,104 +838,110 @@ class Lampiran7CGenerator:
         for label, value in meta_items:
             p = self.doc.add_paragraph()
             p.add_run(f"{label}: ").bold = True
-            p.add_run(value)
+            p.add_run(value or "")
 
         self.doc.add_paragraph()
 
-
     def _add_scenario_table(self):
         """Add the main scenario table following ASPI format."""
-        # Header row + data rows
-        num_rows = len(self.scenarios) + 1
+        # Filter only QR MPM scenarios (ASPI no starting with 18.)
+        qr_scenarios = [s for s in self.scenarios if s.get("aspi_no", "").startswith("18.")]
+        
+        if not qr_scenarios:
+            # If no ASPI numbers detected, use all scenarios from QR MPM section
+            qr_scenarios = [s for s in self.scenarios 
+                          if "qr" in s.get("section", "").lower() or 
+                             "qr" in s.get("nama_modul", "").lower() or
+                             s.get("aspi_no", "").startswith("18.")]
+
+        num_rows = len(qr_scenarios) + 1  # +1 for header
         table = create_table_with_borders(self.doc, num_rows, 8)
 
         # Set column widths
-        col_widths = [Cm(1.2), Cm(2.5), Cm(3.5), Cm(3.5), Cm(5.5), Cm(5.5), Cm(1.5), Cm(3.5)]
+        col_widths = [Cm(1.0), Cm(2.5), Cm(4.0), Cm(3.5), Cm(11.0), Cm(11.0), Cm(1.5), Cm(4.0)]
         for i, width in enumerate(col_widths):
             table.columns[i].width = width
 
         # Header row
-        headers = ["No", "Service", "Scenario", "Expected Result", "Request", "Response", "Result", "Notes"]
+        headers = ["No", "Service", "Scenario", "Expected Result",
+                   "Request", "Response", "Result", "Notes"]
         for i, header in enumerate(headers):
             cell = table.rows[0].cells[i]
-            cell.text = ""
-            p = cell.paragraphs[0]
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(header)
-            run.bold = True
-            run.font.size = Pt(9)
+            add_cell_text(cell, header, font_size=Pt(9), bold=True,
+                         color=RGBColor(255, 255, 255),
+                         alignment=WD_ALIGN_PARAGRAPH.CENTER)
             set_cell_shading(cell, "4472C4")
-            run.font.color.rgb = RGBColor(255, 255, 255)
 
         # Data rows
-        for row_idx, scenario in enumerate(self.scenarios, 1):
+        for row_idx, scenario in enumerate(qr_scenarios, 1):
             row = table.rows[row_idx]
-
-            # Determine result
-            is_skipped = self._is_scenario_skipped(scenario)
-            if is_skipped:
-                result_text = "N/A"
-                notes_text = scenario.get("notes", "") or SKIP_REASON
+            
+            result = self.validator.validate(scenario)
+            
+            # Determine notes
+            if scenario["is_skipped"]:
+                notes = scenario.get("remarks_raw", "") or SKIP_REASON
+                if not notes or notes == "None":
+                    notes = SKIP_REASON
             else:
-                result_text = self.validator.validate(scenario)
-                notes_text = scenario.get("notes", "")
+                notes = ""
+
+            # Format request column - extract from parsed remarks
+            request_output = scenario.get("request", "")
+            
+            # Format response column
+            response_output = scenario.get("response", "")
+
+            # Extract scenario name from langkah_tes
+            scenario_name = self._extract_scenario_name(scenario.get("langkah_tes", ""))
+            
+            # Determine service name
+            service_name = scenario.get("nama_modul", "Any Service")
+
+            # Row number (ASPI numbering)
+            row_no = scenario.get("aspi_no", scenario.get("nomor_kasus_tes", ""))
 
             # Fill cells
-            cell_data = [
-                scenario.get("no", ""),
-                scenario.get("service", ""),
-                scenario.get("scenario", ""),
-                scenario.get("expected_result", ""),
-                self._format_request(scenario.get("request", "")),
-                self._format_response(scenario.get("response", "")),
-                result_text,
-                notes_text,
-            ]
+            # Col 0: No
+            add_cell_text(row.cells[0], row_no, font_size=Pt(8),
+                         alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            # Col 1: Service
+            add_cell_text(row.cells[1], service_name, font_size=Pt(8))
+            # Col 2: Scenario
+            add_cell_text(row.cells[2], scenario_name, font_size=Pt(8))
+            # Col 3: Expected Result
+            add_cell_text(row.cells[3], scenario.get("expected_result", ""), font_size=Pt(8))
+            # Col 4: Request (URL + Headers + Body)
+            add_cell_text(row.cells[4], request_output, 
+                         font_name='Consolas', font_size=Pt(7))
+            # Col 5: Response
+            add_cell_text(row.cells[5], response_output, 
+                         font_name='Consolas', font_size=Pt(7))
+            # Col 6: Result
+            result_color = None
+            if result == "PASS":
+                result_color = RGBColor(0, 128, 0)
+            elif result == "NOT PASS":
+                result_color = RGBColor(255, 0, 0)
+            add_cell_text(row.cells[6], result, font_size=Pt(8),
+                         bold=True, color=result_color,
+                         alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            # Col 7: Notes
+            add_cell_text(row.cells[7], notes, font_size=Pt(7))
 
-            for col_idx, data in enumerate(cell_data):
-                cell = row.cells[col_idx]
-                cell.text = ""
-                p = cell.paragraphs[0]
-                run = p.add_run(str(data) if data and data != "None" else "")
-                run.font.size = Pt(8)
-
-                # Color coding for result
-                if col_idx == 6:  # Result column
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    run.bold = True
-                    if result_text == "PASS":
-                        run.font.color.rgb = RGBColor(0, 128, 0)
-                    elif result_text == "NOT PASS":
-                        run.font.color.rgb = RGBColor(255, 0, 0)
-
-    def _is_scenario_skipped(self, scenario):
-        """Determine if a scenario should be marked as skipped."""
-        no = scenario["no"]
-        if (not scenario.get("request") or scenario["request"] in ["None", "", "URL Endpoint:\nHeader Request:\nRequest Body:"]) \
-           and (not scenario.get("response") or scenario["response"] in ["None", "", "Response Body:"]):
-            if scenario.get("notes") and "tidak" in scenario["notes"].lower():
-                return True
-            if no in self.skipped:
-                return True
-        return False
-
-    def _format_request(self, request_text):
-        """Format request text for table cell."""
-        if not request_text or request_text in ["None", ""]:
+    def _extract_scenario_name(self, langkah_tes):
+        """Extract scenario name from Langkah Tes, removing ASPI number prefix."""
+        if not langkah_tes:
             return ""
-        return request_text
-
-    def _format_response(self, response_text):
-        """Format response text for table cell."""
-        if not response_text or response_text in ["None", ""]:
-            return ""
-        return response_text
-
+        # Remove leading number pattern like "18,1 " or "3,5 "
+        cleaned = re.sub(r'^\d+[,.]\d+\s*', '', langkah_tes)
+        # Remove comment artifacts
+        cleaned = re.sub(r'\n.*?======.*', '', cleaned, flags=re.DOTALL)
+        return cleaned.strip()
 
     def _add_footer_notes(self):
         """Add footer notes as per ASPI requirements."""
         self.doc.add_paragraph()
-
         notes = [
             "Lampiran Skenario hasil uji fungsional sekurangnya 1 Pengguna Layanan atas 1 sub API unverified, dengan ketentuan sebagai berikut:",
             "",
@@ -710,13 +953,262 @@ class Lampiran7CGenerator:
             "",
             "d. Dalam hal terdapat penambahan skenario pengujian, maka penambahan tersebut dilakukan pada baris paling bawah, sehingga tidak mengubah susunan atau urutan template skenario.",
         ]
-
         for note in notes:
             p = self.doc.add_paragraph()
             p.paragraph_format.left_indent = Cm(1)
             run = p.add_run(note)
             run.font.size = Pt(8)
             run.italic = True
+
+
+
+# =============================================================================
+# UAT RESULT DOCUMENT GENERATOR
+# =============================================================================
+
+class UATResultGenerator:
+    """Generate UAT Result document (.docx)."""
+
+    def __init__(self, scenarios, metadata):
+        self.scenarios = scenarios
+        self.metadata = metadata
+        self.doc = Document()
+        self.validator = ResultValidator()
+
+    def generate(self, output_path):
+        """Generate the UAT Result document."""
+        self._set_styles()
+        self._add_title_page()
+        self._add_table_of_contents()
+        self._add_skipped_sections()
+        self._add_qr_mpm_section()
+        self._add_additional_sections()
+        self._add_summary()
+
+        self.doc.save(output_path)
+        print(f"[OK] UAT Result saved: {output_path}")
+
+    def _set_styles(self):
+        """Set default document styles."""
+        style = self.doc.styles['Normal']
+        font = style.font
+        font.name = 'Calibri'
+        font.size = Pt(10)
+
+    def _add_title_page(self):
+        """Add title page."""
+        for _ in range(3):
+            self.doc.add_paragraph()
+
+        title = self.doc.add_paragraph()
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title.add_run("UAT Result")
+        run.bold = True
+        run.font.size = Pt(24)
+
+        self.doc.add_paragraph()
+
+        subtitle = self.doc.add_paragraph()
+        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = subtitle.add_run("Penambahan Layanan QRIS Merchant Aggregator")
+        run.bold = True
+        run.font.size = Pt(16)
+
+        self.doc.add_paragraph()
+
+        info = self.doc.add_paragraph()
+        info.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        info.add_run(f"Nama Penyedia Layanan: {self.metadata.get('nama_penyedia', '')}").font.size = Pt(11)
+        info.add_run("\n")
+        info.add_run(f"Nama Pengguna Layanan: {self.metadata.get('nama_pengguna', '')}").font.size = Pt(11)
+        info.add_run("\n")
+        info.add_run(f"Tanggal Pengujian: {self.metadata.get('tanggal_pengujian', '')}").font.size = Pt(11)
+
+        self.doc.add_page_break()
+
+    def _add_table_of_contents(self):
+        """Add table of contents."""
+        self.doc.add_heading("Daftar Isi", level=1)
+
+        toc_items = [
+            "1  Balance Services",
+            "2  API Transaction History List",
+            "3  QR MPM",
+            "4  Pengecekan Mutasi Dan Jurnal",
+            "5  Generate QR SNAP",
+            "6  Refund Payment",
+            "7  Query Payment",
+            "8  Inquiry & Report",
+        ]
+        for item in toc_items:
+            p = self.doc.add_paragraph()
+            p.paragraph_format.left_indent = Cm(1)
+            p.add_run(item).font.size = Pt(10)
+
+        self.doc.add_page_break()
+
+    def _add_skipped_sections(self):
+        """Add Balance Services and Transaction History (all skipped)."""
+        self.doc.add_heading("1 Balance Services", level=1)
+        p = self.doc.add_paragraph()
+        p.add_run(SKIP_REASON).italic = True
+        self.doc.add_paragraph()
+
+        self.doc.add_heading("2 API Transaction History List", level=1)
+        p = self.doc.add_paragraph()
+        p.add_run(SKIP_REASON).italic = True
+        self.doc.add_page_break()
+
+    def _add_qr_mpm_section(self):
+        """Add QR MPM section with test results."""
+        self.doc.add_heading("3 QR MPM", level=1)
+
+        # Get QR MPM scenarios
+        qr_scenarios = [s for s in self.scenarios if s.get("aspi_no", "").startswith("18.")]
+        
+        if not qr_scenarios:
+            qr_scenarios = [s for s in self.scenarios 
+                          if "qr" in s.get("section", "").lower() or
+                             "qr" in s.get("nama_modul", "").lower()]
+
+        for idx, scenario in enumerate(qr_scenarios, 1):
+            scenario_name = re.sub(r'^\d+[,.]\d+\s*', '', scenario.get("langkah_tes", ""))
+            scenario_name = re.sub(r'\n.*?======.*', '', scenario_name, flags=re.DOTALL).strip()
+            
+            aspi_no = scenario.get("aspi_no", "")
+            self.doc.add_heading(f"3.{idx} {aspi_no} {scenario_name}", level=2)
+
+            if scenario["is_skipped"]:
+                p = self.doc.add_paragraph()
+                p.add_run(SKIP_REASON).italic = True
+            else:
+                self._add_scenario_detail(scenario)
+
+            self.doc.add_paragraph()
+
+    def _add_scenario_detail(self, scenario):
+        """Add detailed scenario with request/response."""
+        # Expected Result
+        p = self.doc.add_paragraph()
+        p.add_run("Expected Result: ").bold = True
+        p.add_run(scenario.get("expected_result", ""))
+
+        # Request (URL + Headers + Body)
+        p = self.doc.add_paragraph()
+        p.add_run("Request:").bold = True
+        
+        request_text = scenario.get("request", "")
+        if request_text:
+            p = self.doc.add_paragraph()
+            p.paragraph_format.left_indent = Cm(0.5)
+            run = p.add_run(request_text)
+            run.font.name = 'Consolas'
+            run.font.size = Pt(8)
+
+        # Response
+        p = self.doc.add_paragraph()
+        p.add_run("Response:").bold = True
+        
+        response_text = scenario.get("response", "")
+        if response_text:
+            p = self.doc.add_paragraph()
+            p.paragraph_format.left_indent = Cm(0.5)
+            run = p.add_run(response_text)
+            run.font.name = 'Consolas'
+            run.font.size = Pt(8)
+
+        # Result
+        result = self.validator.validate(scenario)
+        p = self.doc.add_paragraph()
+        p.add_run("Result: ").bold = True
+        result_run = p.add_run(result)
+        result_run.bold = True
+        if result == "PASS":
+            result_run.font.color.rgb = RGBColor(0, 128, 0)
+        elif result == "NOT PASS":
+            result_run.font.color.rgb = RGBColor(255, 0, 0)
+
+    def _add_additional_sections(self):
+        """Add remaining sections (Pengecekan Mutasi, etc.)."""
+        self.doc.add_page_break()
+        
+        sections = [
+            ("4", "Pengecekan Mutasi Dan Jurnal"),
+            ("5", "Generate QR SNAP"),
+            ("6", "Refund Payment"),
+            ("7", "Query Payment"),
+            ("8", "Inquiry & Report"),
+        ]
+
+        for num, title in sections:
+            self.doc.add_heading(f"{num} {title}", level=1)
+            
+            # Find scenarios for this section
+            section_scenarios = [s for s in self.scenarios 
+                               if title.lower() in s.get("section", "").lower() or
+                                  title.lower() in s.get("nama_modul", "").lower()]
+            
+            if section_scenarios:
+                for s in section_scenarios:
+                    p = self.doc.add_paragraph()
+                    langkah = s.get("langkah_tes", "")
+                    hasil = s.get("hasil_aktual", "")
+                    p.add_run(f"- {langkah}: ").bold = True
+                    p.add_run(hasil)
+            else:
+                p = self.doc.add_paragraph()
+                p.add_run(SKIP_REASON).italic = True
+            
+            self.doc.add_paragraph()
+
+    def _add_summary(self):
+        """Add summary table."""
+        self.doc.add_page_break()
+        self.doc.add_heading("Ringkasan Hasil Pengujian", level=1)
+
+        total = 0
+        passed = 0
+        failed = 0
+        skipped = 0
+        not_tested = 0
+
+        for s in self.scenarios:
+            total += 1
+            result = self.validator.validate(s)
+            if result == "N/A":
+                skipped += 1
+            elif result == "PASS":
+                passed += 1
+            elif result == "NOT PASS":
+                failed += 1
+            else:
+                not_tested += 1
+
+        # Summary table
+        table = create_table_with_borders(self.doc, 6, 2)
+        table.columns[0].width = Cm(8)
+        table.columns[1].width = Cm(4)
+
+        data = [
+            ("Kategori", "Jumlah"),
+            ("Total Skenario", str(total)),
+            ("PASS", str(passed)),
+            ("NOT PASS", str(failed)),
+            ("Tidak Diuji (N/A)", str(skipped)),
+            ("Belum Diisi", str(not_tested)),
+        ]
+
+        for i, (label, value) in enumerate(data):
+            add_cell_text(table.rows[i].cells[0], label, font_size=Pt(10),
+                         bold=(i == 0),
+                         color=RGBColor(255, 255, 255) if i == 0 else None)
+            add_cell_text(table.rows[i].cells[1], value, font_size=Pt(10),
+                         bold=(i == 0),
+                         color=RGBColor(255, 255, 255) if i == 0 else None,
+                         alignment=WD_ALIGN_PARAGRAPH.CENTER)
+            if i == 0:
+                set_cell_shading(table.rows[i].cells[0], "4472C4")
+                set_cell_shading(table.rows[i].cells[1], "4472C4")
 
 
 
@@ -732,17 +1224,22 @@ def main():
     print("=" * 60)
     print()
 
-    # Default input/output paths
+    # Input file
     if len(sys.argv) > 1:
         input_excel = sys.argv[1]
     else:
-        input_excel = "UAT_Script_QRIS.xlsx"
+        # Auto-find .xlsx file in current directory
+        xlsx_files = [f for f in os.listdir('.') if f.endswith('.xlsx') and not f.startswith('~')]
+        if xlsx_files:
+            input_excel = xlsx_files[0]
+            print(f"[INFO] Auto-detected Excel file: {input_excel}")
+        else:
+            print("ERROR: File Excel (.xlsx) tidak ditemukan.")
+            print(f"Usage: python {sys.argv[0]} <path_to_uat_script.xlsx>")
+            sys.exit(1)
 
     if not os.path.exists(input_excel):
         print(f"ERROR: File tidak ditemukan: {input_excel}")
-        print(f"Usage: python {sys.argv[0]} <path_to_uat_script.xlsx>")
-        print()
-        print("Pastikan file UAT Script Excel yang sudah diisi mitra tersedia.")
         sys.exit(1)
 
     # Output paths
@@ -757,29 +1254,29 @@ def main():
     print(f"[1/3] Membaca UAT Script: {input_excel}")
     parser = UATScriptParser(input_excel)
     scenarios, metadata = parser.parse()
-    print(f"      -> {len(scenarios)} skenario ditemukan")
+    
+    if not scenarios:
+        print("ERROR: Tidak ada skenario yang ditemukan. Periksa format Excel.")
+        sys.exit(1)
+
     print(f"      -> Nama Pengguna: {metadata.get('nama_pengguna', '(belum diisi)')}")
     print(f"      -> Tanggal: {metadata.get('tanggal_pengujian', '(belum diisi)')}")
+    
+    # Show parsing summary
+    tested = sum(1 for s in scenarios if s["is_tested"])
+    skipped = sum(1 for s in scenarios if s["is_skipped"])
+    print(f"      -> Tested: {tested}, Skipped: {skipped}, Total: {len(scenarios)}")
     print()
-
-    # Define skipped scenarios based on product
-    # These are scenarios highlighted yellow (not applicable for this product)
-    skipped = set()
-    for s in scenarios:
-        no = s["no"]
-        # Auto-detect skipped: if notes contain skip reason or no data filled
-        if s.get("notes") and ("tidak dites" in s["notes"].lower() or "tidak dilakukan" in s["notes"].lower()):
-            skipped.add(no)
 
     # Generate UAT Result
     print(f"[2/3] Generating UAT Result...")
-    uat_gen = UATResultGenerator(scenarios, metadata, skipped)
+    uat_gen = UATResultGenerator(scenarios, metadata)
     uat_gen.generate(uat_result_path)
     print()
 
     # Generate Lampiran 7C
     print(f"[3/3] Generating Lampiran 7C (Berita Acara)...")
-    lamp_gen = Lampiran7CGenerator(scenarios, metadata, skipped)
+    lamp_gen = Lampiran7CGenerator(scenarios, metadata)
     lamp_gen.generate(lampiran_7c_path)
     print()
 
@@ -794,20 +1291,22 @@ def main():
 
     # Validation summary
     validator = ResultValidator()
-    passed = sum(1 for s in scenarios if validator.validate(s) == "PASS" and s["no"] not in skipped)
-    failed = sum(1 for s in scenarios if validator.validate(s) == "NOT PASS" and s["no"] not in skipped)
-    na = len(skipped)
-    not_tested = len(scenarios) - passed - failed - na
+    passed = sum(1 for s in scenarios if validator.validate(s) == "PASS")
+    failed = sum(1 for s in scenarios if validator.validate(s) == "NOT PASS")
+    na = sum(1 for s in scenarios if validator.validate(s) == "N/A")
+    not_tested = sum(1 for s in scenarios if validator.validate(s) == "NOT TESTED")
 
     print(f"  Hasil Validasi:")
-    print(f"    PASS      : {passed}")
-    print(f"    NOT PASS  : {failed}")
-    print(f"    N/A       : {na}")
+    print(f"    PASS       : {passed}")
+    print(f"    NOT PASS   : {failed}")
+    print(f"    N/A        : {na}")
     print(f"    Belum Diisi: {not_tested}")
     print()
 
     if failed > 0:
         print("  [WARNING] Ada skenario NOT PASS! Review kembali sebelum submit ke ASPI.")
+    elif not_tested > 0:
+        print("  [INFO] Masih ada skenario yang belum diisi data request/response.")
     else:
         print("  [OK] Semua skenario yang diuji PASS. Siap submit ke ASPI Portal.")
 
