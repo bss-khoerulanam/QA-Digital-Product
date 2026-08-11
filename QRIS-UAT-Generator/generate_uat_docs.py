@@ -309,7 +309,7 @@ class RemarksParser:
         if url:
             parts.append(url)
         if headers:
-            parts.append(f"\nHeaders:\n{headers}")
+            parts.append(f"\n{headers}")
         if body:
             parts.append(f"\nRequest Body:\n{body}")
         return '\n'.join(parts).strip()
