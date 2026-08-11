@@ -782,18 +782,37 @@ def create_table_with_borders(doc, rows, cols):
 
 def add_cell_text(cell, text, font_name='Calibri', font_size=Pt(8),
                   bold=False, color=None, alignment=None):
-    """Add formatted text to a table cell."""
+    """Add formatted text to a table cell, properly handling newlines."""
     cell.text = ""
-    p = cell.paragraphs[0]
-    if alignment:
-        p.alignment = alignment
-    run = p.add_run(str(text) if text else "")
-    run.font.name = font_name
-    run.font.size = font_size
-    run.bold = bold
-    if color:
-        run.font.color.rgb = color
-    return run
+    
+    if not text:
+        return None
+    
+    text_str = str(text)
+    lines = text_str.split('\n')
+    
+    # Use the first paragraph already in the cell
+    for line_idx, line in enumerate(lines):
+        if line_idx == 0:
+            p = cell.paragraphs[0]
+        else:
+            p = cell.add_paragraph()
+        
+        if alignment:
+            p.alignment = alignment
+        
+        # Set small spacing between paragraphs for compact display
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        
+        run = p.add_run(line)
+        run.font.name = font_name
+        run.font.size = font_size
+        run.bold = bold
+        if color:
+            run.font.color.rgb = color
+    
+    return None
 
 
 
