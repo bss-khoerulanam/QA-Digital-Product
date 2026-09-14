@@ -283,6 +283,9 @@
         </div>
 
         <!-- Configuration Section -->
+        <!-- Disembunyikan permanen atas permintaan pengguna. Markup dipertahankan
+             agar input metadata tetap ada di DOM (dibaca sebagai fallback oleh
+             app.js); app.js tidak pernah menampilkan kartu ini lagi. -->
         <div class="card" id="configCard" style="display:none">
             <h2>2. Konfigurasi (Opsional)</h2>
             <div class="config-grid">
@@ -310,6 +313,9 @@
         </div>
 
         <!-- Preview & Results Section -->
+        <!-- Disembunyikan permanen atas permintaan pengguna. Validasi tetap
+             dihitung di app.js (untuk isi dokumen), hanya tampilan kartu ini
+             yang tidak dimunculkan. -->
         <div class="card" id="resultsCard" style="display:none">
             <h2>3. Hasil Validasi</h2>
             <div class="summary-cards" id="summaryCards"></div>
