@@ -22,6 +22,7 @@ import sys
 import os
 import argparse
 from datetime import datetime
+from difflib import SequenceMatcher
 
 from openpyxl import load_workbook
 from docx import Document
@@ -1451,16 +1452,42 @@ class TemplateMerger:
     (Expected Result, Request [URL + Headers + Body], Response) disisipkan TEPAT
     DI BAWAH screenshot skenario tersebut, tanpa menghapus/merusak screenshot.
 
-    ASUMSI STRUKTUR TEMPLATE (didokumentasikan; template asli belum tersedia):
-      - Tiap skenario dipisahkan oleh sebuah paragraf HEADING yang diawali nomor
-        ASPI, mis. "18.1 ...", "18.2 ...", "18,18 ..." (pemisah titik atau koma).
+    DASAR PENCOCOKAN = KECOCOKAN NAMA SKENARIO (instruksi user:
+    "basisnya gunakan kecocokan nama skenario untuk validasimu"). Bukan lagi
+    nomor ASPI, sehingga skenario yang TIDAK bernomor di template (mis.
+    "Melakukan refund transaksi issuer BSS", "Melakukan cek status QR") juga
+    ikut tercocokkan.
+
+    STRUKTUR TEMPLATE (sudah diverifikasi dari file asli):
+      - Judul skenario = paragraf ber-style "Heading 2".
+      - Pengelompokan section = paragraf ber-style "Heading 1" (mis. "Balance
+        Services", "API Transaction History List", "QR MPM", "Pengecekan Mutasi
+        Dan Jurnal").
+      - Sebagian heading diawali nomor koma ("3,1 Access Token Invalid"),
+        sebagian TIDAK ("Melakukan cek status QR"). Prefiks nomor dibuang saat
+        menormalkan nama.
       - Screenshot / gambar skenario berada di antara heading skenario itu dan
         heading skenario BERIKUTNYA.
       - Titik sisip = SETELAH blok skenario (setelah screenshot), yaitu TEPAT
         SEBELUM heading skenario berikutnya; untuk skenario terakhir disisipkan
         di AKHIR dokumen.
-      - Skenario di data yang tidak punya heading pasangan di template dilewati
-        dengan aman (warning), tidak membuat proses gagal.
+
+    STRATEGI PENCOCOKAN NAMA (section-aware + berurutan + fuzzy):
+      - Banyak nama IDENTIK lintas section ("Access Token Invalid" di 3.x/4.x/
+        18.x; "Melakukan  pengecekan mutasi dan jurnal" 6x). Pencocokan nama
+        murni akan salah tempel. Karena itu pencocokan dilakukan PER SECTION dan
+        BERURUT MAJU: skenario Excel diproses sesuai urutan dokumen dan
+        dicocokkan ke heading template yang BELUM terpakai; tiap heading dipakai
+        maksimal SEKALI (tidak pernah mundur ke heading yang sudah dipakai).
+      - Beda kecil teks ditoleransi lewat normalisasi (lowercase, rapatkan spasi
+        ganda, samakan tanda kutip/elipsis, buang prefiks nomor) plus fuzzy
+        difflib.SequenceMatcher / containment (threshold ~0.82) dan penyamaan
+        "QRIS" vs "QR" (mis. Excel "Melakukan transaksi QRIS sukses" cocok ke
+        template "Melakukan transaksi QR sukses"). Hanya stdlib (difflib).
+      - Skenario Excel tanpa pasangan heading (mis. "Query Successful
+        Transaction", "Notification for Successful/Failed Transaction") DILEWATI
+        dengan WARNING bernama, tidak membuat proses gagal. Heading template
+        tanpa pasangan Excel dibiarkan apa adanya (tidak dihapus).
 
     Teknik python-docx: python-docx tidak punya API "insert setelah". Kita pakai
     paragraph.insert_paragraph_before(...) pada heading BERIKUTNYA (atau
@@ -1468,45 +1495,92 @@ class TemplateMerger:
     utuh dan urutan terjaga.
     """
 
-    # Nomor ASPI di awal teks heading, mis. "18.1", "18,18", "3.5"
-    _ASPI_RE = re.compile(r'^\s*(\d+)[.,](\d+)\b')
+    # Prefiks nomor di awal nama, mis. "18,1 ", "3.5 " (titik atau koma).
+    _NUM_PREFIX_RE = re.compile(r'^\s*\d+[.,]\d+\s*')
+    # Ambang fuzzy untuk menerima kecocokan nama.
+    _NAME_THRESHOLD = 0.82
+    # Ambang kelonggaran agar dua nama section dianggap section yang sama.
+    _SECTION_THRESHOLD = 0.6
 
     def __init__(self, template_path, scenarios, metadata):
         self.template_path = template_path
         self.scenarios = scenarios
         self.metadata = metadata
         self.doc = Document(template_path)
-        # Map nomor ASPI -> skenario (skenario pertama untuk nomor tsb).
-        self.by_aspi = {}
-        for s in scenarios:
-            aspi = s.get("aspi_no", "")
-            if aspi and aspi not in self.by_aspi:
-                self.by_aspi[aspi] = s
 
     @classmethod
-    def _heading_aspi(cls, paragraph):
-        """Kembalikan nomor ASPI (mis. '18.1') jika paragraf ini heading skenario."""
-        text = (paragraph.text or "").strip()
+    def _normalize_name(cls, text):
+        """Normalkan nama skenario untuk pencocokan.
+
+        - ambil baris pertama saja (nama Excel/template kadang multi-baris),
+        - buang prefiks nomor koma/titik ("18,1 "),
+        - lowercase, samakan tanda kutip & elipsis, rapatkan spasi ganda.
+        """
         if not text:
-            return None
-        m = cls._ASPI_RE.match(text)
-        if not m:
-            return None
-        return f"{m.group(1)}.{m.group(2)}"
+            return ""
+        first = ""
+        for line in str(text).splitlines():
+            if line.strip():
+                first = line
+                break
+        t = cls._NUM_PREFIX_RE.sub('', first).lower()
+        t = (t.replace('\u201c', '"').replace('\u201d', '"')
+              .replace('\u2019', "'").replace('\u2018', "'")
+              .replace('\u2026', '...'))
+        t = t.replace('"', ' ').replace("'", ' ')
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t
+
+    @staticmethod
+    def _normalize_section(text):
+        """Normalkan nama section (Heading 1) untuk perbandingan longgar."""
+        if not text:
+            return ""
+        return re.sub(r'\s+', ' ', str(text).lower()).strip()
+
+    @classmethod
+    def _similar(cls, a, b):
+        """Skor kemiripan 0..1: sama persis / containment / SequenceMatcher."""
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        if a in b or b in a:
+            return 0.95
+        return SequenceMatcher(None, a, b).ratio()
+
+    @classmethod
+    def _name_score(cls, excel_name, tpl_name):
+        """Skor kecocokan nama, dengan penyamaan QRIS<->QR."""
+        score = cls._similar(excel_name, tpl_name)
+        if score < 1.0:
+            fold = cls._similar(excel_name.replace('qris', 'qr'),
+                                tpl_name.replace('qris', 'qr'))
+            score = max(score, fold)
+        return score
 
     def _find_scenario_headings(self):
-        """Temukan paragraf heading skenario di template beserta nomor ASPI-nya.
+        """Temukan heading skenario (Heading 2) di template beserta section-nya.
 
-        Return list of (index_in_doc_paragraphs, paragraph, aspi_no) urut sesuai
-        kemunculan di dokumen. Hanya heading yang nomornya ADA di data yang
-        dianggap titik sisip (agar teks lain berangka seperti '1.1 Pendahuluan'
-        tidak keliru dikenali).
+        Return list of dict: {para, section, name} urut sesuai kemunculan di
+        dokumen. Section diambil dari Heading 1 terakhir yang dilewati.
         """
         headings = []
-        for idx, p in enumerate(self.doc.paragraphs):
-            aspi = self._heading_aspi(p)
-            if aspi and aspi in self.by_aspi:
-                headings.append((idx, p, aspi))
+        current_section = ""
+        for p in self.doc.paragraphs:
+            style = p.style.name if p.style is not None else ""
+            text = (p.text or "").strip()
+            if not text:
+                continue
+            if style == "Heading 1":
+                current_section = text
+            elif style == "Heading 2":
+                headings.append({
+                    "para": p,
+                    "section": current_section,
+                    "name": self._normalize_name(text),
+                    "raw": text,
+                })
         return headings
 
     def _insert_line_before(self, ref_paragraph, text, bold=False,
@@ -1546,13 +1620,19 @@ class TemplateMerger:
         # Baris kosong pemisah dari screenshot di atasnya.
         self._insert_line_before(ref_paragraph, "")
 
-        # Expected Result (label bold + nilai pada paragraf yang sama).
+        # Expected Result (label bold + nilai). Nilai bisa multi-baris; render
+        # tiap baris sebagai break dalam satu paragraf (Word tidak merender '\\n'
+        # dalam satu run).
         p = (self.doc.add_paragraph() if ref_paragraph is None
              else ref_paragraph.insert_paragraph_before())
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
         p.add_run("Expected Result: ").bold = True
-        p.add_run(scenario.get("expected_result", ""))
+        expected_lines = str(scenario.get("expected_result", "") or "").split('\n')
+        run = p.add_run(expected_lines[0] if expected_lines else "")
+        for line in expected_lines[1:]:
+            run.add_break()
+            run.add_text(line)
 
         # Request (URL + Headers + Body), satu baris per paragraf.
         self._insert_line_before(ref_paragraph, "", label="Request:")
@@ -1564,43 +1644,97 @@ class TemplateMerger:
         for line in str(scenario.get("response", "") or "").split('\n'):
             self._insert_line_before(ref_paragraph, line, monospace=True)
 
+    def _match_scenarios_to_headings(self, headings):
+        """Cocokkan skenario Excel ke heading template berbasis NAMA.
+
+        Section-aware + berurutan MAJU: skenario Excel diproses sesuai urutan
+        dokumen; tiap skenario dicocokkan ke heading template yang BELUM terpakai
+        di section yang sama, dengan skor kemiripan tertinggi >= threshold.
+        Tiap heading dipakai maksimal SEKALI (tidak mundur ke yang sudah dipakai).
+
+        Return (matches, missed):
+          - matches: list (heading_index, scenario) urut sesuai heading di dokumen
+          - missed:  list skenario Excel yang tak menemukan pasangan heading
+        """
+        used = [False] * len(headings)
+        heading_to_scenario = {}
+        missed = []
+
+        for scenario in self.scenarios:
+            excel_name = self._normalize_name(scenario.get("langkah_tes", ""))
+            excel_sec = self._normalize_section(scenario.get("section", ""))
+            best_j = -1
+            best_score = 0.0
+            for j, h in enumerate(headings):
+                if used[j]:
+                    continue
+                # Gerbang section: nama section harus mirip (longgar).
+                if self._similar(excel_sec,
+                                 self._normalize_section(h["section"])) < \
+                        self._SECTION_THRESHOLD:
+                    continue
+                score = self._name_score(excel_name, h["name"])
+                if score >= self._NAME_THRESHOLD and score > best_score:
+                    best_score = score
+                    best_j = j
+                    if score >= 1.0:
+                        break
+            if best_j >= 0:
+                used[best_j] = True
+                heading_to_scenario[best_j] = scenario
+            else:
+                missed.append(scenario)
+
+        matches = [(j, heading_to_scenario[j])
+                   for j in sorted(heading_to_scenario.keys())]
+        return matches, missed
+
+    @staticmethod
+    def _scenario_label(scenario):
+        """Nama skenario yang informatif untuk log/warning."""
+        name = TemplateMerger._normalize_name(scenario.get("langkah_tes", ""))
+        if not name:
+            name = (scenario.get("langkah_tes", "") or "").strip()
+        kasus = scenario.get("nomor_kasus_tes", "")
+        return f"{kasus} {name}".strip() if kasus else name
+
     def merge(self, output_path):
         """Sisipkan konten generator ke template lalu simpan dokumen gabungan."""
         headings = self._find_scenario_headings()
 
         if not headings:
-            print("      [WARNING] Tidak ada heading skenario bernomor ASPI yang "
-                  "cocok di template. Tidak ada yang disisipkan.")
-            print("      Pastikan tiap skenario diawali heading bernomor, mis. "
-                  "'18.1 ...', '18.2 ...'.")
+            print("      [WARNING] Tidak ada heading skenario (Heading 2) di "
+                  "template. Tidak ada yang disisipkan.")
+            print("      Pastikan tiap skenario punya judul ber-style 'Heading 2'.")
 
-        # Nomor ASPI yang benar-benar ada headingnya di template.
-        matched_aspi = {aspi for (_, _, aspi) in headings}
+        matches, missed = self._match_scenarios_to_headings(headings)
 
+        # Titik sisip tiap skenario yang cocok = TEPAT SEBELUM heading skenario
+        # BERIKUTNYA (agar log muncul setelah screenshot), atau akhir dokumen
+        # untuk pasangan terakhir. "Berikutnya" ditentukan dari urutan heading
+        # di dokumen, bukan urutan pencocokan.
+        matched_h_indices = [j for (j, _) in matches]
         inserted = 0
-        for i, (idx, para, aspi) in enumerate(headings):
-            scenario = self.by_aspi.get(aspi)
-            if scenario is None:
-                continue
-            # Titik sisip = tepat sebelum heading skenario BERIKUTNYA (jika ada),
-            # atau di akhir dokumen untuk skenario terakhir.
-            if i + 1 < len(headings):
-                next_para = headings[i + 1][1]
+        for pos, (j, scenario) in enumerate(matches):
+            if pos + 1 < len(matched_h_indices):
+                next_para = headings[matched_h_indices[pos + 1]]["para"]
             else:
                 next_para = None
             self._insert_scenario_block(next_para, scenario)
             inserted += 1
-            print(f"      -> Skenario {aspi} disisipkan setelah screenshot.")
+            print(f"      -> '{headings[j]['raw']}' <- {self._scenario_label(scenario)}")
 
-        # Peringatkan skenario data yang tidak punya heading di template.
-        missing = [a for a in self.by_aspi.keys() if a not in matched_aspi]
-        if missing:
-            print(f"      [WARNING] {len(missing)} skenario data tanpa heading di "
-                  f"template (dilewati): {', '.join(sorted(missing))}")
+        # Peringatkan skenario Excel yang tidak punya heading pasangan.
+        if missed:
+            print(f"      [WARNING] {len(missed)} skenario Excel tanpa heading "
+                  f"pasangan di template (dilewati):")
+            for s in missed:
+                print(f"                - {self._scenario_label(s)}")
 
         self.doc.save(output_path)
         print(f"[OK] UAT Result (gabungan template) saved: {output_path}")
-        print(f"      -> {inserted} skenario disisipkan ke template.")
+        print(f"      -> {inserted} skenario cocok tersisip, "
+              f"{len(missed)} terlewat (dari {len(self.scenarios)} skenario Excel).")
         return inserted
 
 
@@ -1633,11 +1767,13 @@ def parse_args():
         help="Path file UAT Script Excel (.xlsx). Jika kosong, auto-detect .xlsx "
              "di direktori kerja saat ini.")
     parser.add_argument(
-        "--template", default=None, metavar="UAT_RESULT.docx",
+        "--template", default=None, nargs="?", const="", metavar="UAT_RESULT.docx",
         help="Path template UAT Result .docx (sudah berisi screenshot tiap "
              "skenario). Bila diberikan, hasil UAT Script disisipkan di bawah "
              "screenshot tiap skenario dan disimpan sebagai UAT Result gabungan. "
-             "Pencocokan skenario memakai nomor ASPI di awal heading (mis. '18.1').")
+             "Pencocokan skenario memakai KECOCOKAN NAMA skenario (section-aware + "
+             "fuzzy), bukan nomor ASPI. Boleh dipakai tanpa path (--template) untuk "
+             "memakai template bawaan di repo bila ada.")
     return parser.parse_args()
 
 
@@ -1668,7 +1804,20 @@ def main():
         print(f"ERROR: File tidak ditemukan: {input_excel}")
         sys.exit(1)
 
+    # --template: bila diberi tanpa path (const ""), pakai template bawaan repo.
+    # Path arbitrer tetap didukung; default (tanpa --template sama sekali) = None.
     template_path = args.template
+    if template_path is not None and template_path.strip() == "":
+        default_tpl = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "UAT Result Penambahan Layanan QRIS Merchant Aggregator.docx")
+        if os.path.exists(default_tpl):
+            template_path = default_tpl
+            print(f"[INFO] Memakai template UAT Result bawaan: {template_path}")
+        else:
+            print("ERROR: --template diberikan tanpa path dan template bawaan "
+                  f"tidak ditemukan di: {default_tpl}")
+            sys.exit(1)
     if template_path and not os.path.exists(template_path):
         print(f"ERROR: File template tidak ditemukan: {template_path}")
         sys.exit(1)

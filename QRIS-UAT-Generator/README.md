@@ -46,15 +46,26 @@ Tool otomatis untuk generate dokumen UAT Result dan Lampiran 7C (Berita Acara) d
 #### Opsi lanjutan (CLI):
 
 ```
-python generate_uat_docs.py <uat_script.xlsx> [--template <uat_result.docx>]
+python generate_uat_docs.py <uat_script.xlsx> [--template [<uat_result.docx>]]
 ```
 
 - Tanpa `--template`: perilaku default, generate **UAT Result** dan **Lampiran 7C** dari nol (seperti sebelumnya).
-- Dengan `--template`: jadikan **template UAT Result .docx** milik Anda (yang sudah berisi **screenshot** tiap skenario) sebagai dasar, lalu sisipkan hasil UAT Script (Expected Result, Request, Response) **tepat di bawah screenshot** tiap skenario. Output ditulis ke `output/UAT_Result_from_template_<tanggal>.docx`, dan **Lampiran 7C** tetap dihasilkan dari nol.
+- Dengan `--template <uat_result.docx>`: jadikan **template UAT Result .docx** milik Anda (yang sudah berisi **screenshot** tiap skenario) sebagai dasar, lalu sisipkan hasil UAT Script (Expected Result, Request, Response) **tepat di bawah screenshot** tiap skenario. Output ditulis ke `output/UAT_Result_from_template_<tanggal>.docx`, dan **Lampiran 7C** tetap dihasilkan dari nol.
+- `--template` boleh dipakai **tanpa path**; jika begitu, tool memakai template bawaan di repo (`QRIS-UAT-Generator/UAT Result Penambahan Layanan QRIS Merchant Aggregator.docx`) bila file itu ada.
 
 > **Catatan:** Fitur `--template` (upload + merge template UAT Result ber-screenshot) **hanya tersedia di versi Python**. Versi Web hanya bisa membuat dokumen baru dan tidak bisa mengedit `.docx` existing yang berisi gambar.
 >
-> **Asumsi struktur template:** tiap skenario diawali sebuah **heading bernomor ASPI** (mis. `18.1 ...`, `18.2 ...`), dan screenshot skenario berada di antara heading itu dan heading skenario berikutnya. Konten disisipkan tepat sebelum heading skenario berikutnya (atau di akhir dokumen untuk skenario terakhir). Skenario data yang tidak punya heading pasangan di template akan dilewati dengan aman (muncul peringatan, proses tidak gagal).
+> **Dasar pencocokan = nama skenario.** Konten UAT Script dicocokkan ke skenario di template berdasarkan **kecocokan NAMA skenario**, bukan nomor ASPI. Ini agar skenario yang **tidak bernomor** di template (mis. `Melakukan cek status QR`, `Melakukan refund transaksi issuer BSS`) juga ikut tercocokkan.
+>
+> **Cara pencocokan (section-aware + berurutan + fuzzy):**
+> - Judul skenario template = paragraf ber-style **Heading 2**; pengelompokan **section** = paragraf ber-style **Heading 1** (mis. `Balance Services`, `QR MPM`, `Pengecekan Mutasi Dan Jurnal`).
+> - Nama dinormalkan lebih dulu: ambil baris pertama, buang prefiks nomor (`18,1 `), lowercase, rapatkan spasi ganda, samakan tanda kutip/elipsis.
+> - Karena banyak nama **identik** lintas section (mis. `Access Token Invalid` di 3.x/4.x/18.x, `Melakukan pengecekan mutasi dan jurnal` yang berulang), pencocokan dilakukan **per section** dan **berurut maju**: skenario Excel diproses sesuai urutan, tiap heading template dipakai **maksimal sekali** sehingga tidak salah tempel.
+> - Beda kecil teks ditoleransi dengan **fuzzy match** (`difflib`, stdlib) + containment (ambang ~0.82) dan penyamaan `QRIS` vs `QR` (mis. Excel `Melakukan transaksi QRIS sukses` cocok ke template `Melakukan transaksi QR sukses`).
+>
+> **Titik sisip:** konten disisipkan **setelah** blok skenario yang sudah ada di template (setelah screenshot) dan **sebelum** heading skenario berikutnya (atau di akhir dokumen untuk skenario terakhir). Screenshot/gambar/paragraf existing tidak dihapus atau digeser.
+>
+> **Yang tak berpasangan:** skenario Excel tanpa heading pasangan di template (mis. `Query Successful Transaction`, `Notification for Successful/Failed Transaction`) **dilewati dengan peringatan bernama** (proses tidak gagal), dan heading template tanpa pasangan Excel dibiarkan apa adanya. Di akhir dicetak ringkasan **berapa skenario cocok tersisip dan berapa terlewat**.
 
 ---
 
