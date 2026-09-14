@@ -3,7 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Generated UAT report artifacts
+# Generated UAT report artifacts (scoped to output locations only;
+# do NOT ignore .docx repo-wide so future partner .docx inputs stay tracked)
 output/
 QRIS-UAT-Generator/output/
-*.docx
+output/*.docx
+QRIS-UAT-Generator/output/*.docx
