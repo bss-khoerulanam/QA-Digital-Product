@@ -1,21 +1,19 @@
 /**
  * QRIS UAT Document Generator - Web Version
  * Bank Sahabat Sampoerna (BSS)
- * 
- * Generates UAT Result and Lampiran 7C documents from UAT Script Excel
+ *
+ * Generates UAT Result and Lampiran 7C documents from UAT Script Excel.
+ *
+ * Parsing logic mirrors the reference Python tool (generate_uat_docs.py):
+ *   - Flexible header-row detection (Kirimo Indonesian layout + old English layout)
+ *   - NAME-based column mapping (no hardcoded positional columns)
+ *   - Remarks column parsed into URL / Headers / Request Body / Response
+ *   - PASS / NOT PASS / N/A / NOT TESTED classification per ASPI rules
+ *
+ * The parsing functions are also exported via module.exports (guarded) so they
+ * can be unit-tested headless under Node/Bun. In the browser (<script>) the
+ * guard is skipped and everything stays on the global scope.
  */
-
-// Global error handler - menampilkan error ke user, bukan cuma console
-window.onerror = function(msg, url, line, col, error) {
-    console.error('Error:', msg, 'at', url, ':', line);
-    alert('Terjadi error: ' + msg + '\n\nLine: ' + line + '\nSilakan buka Console (F12) untuk detail.');
-    return false;
-};
-
-window.addEventListener('unhandledrejection', function(event) {
-    console.error('Unhandled promise rejection:', event.reason);
-    alert('Terjadi error async: ' + (event.reason?.message || event.reason) + '\n\nSilakan buka Console (F12) untuk detail.');
-});
 
 // =============================================================================
 // GLOBAL STATE
@@ -29,167 +27,242 @@ let metadata = {
     tanggal_pengujian: ""
 };
 let skippedSet = new Set();
+let currentFileData = null; // ArrayBuffer of the loaded file, awaiting "Proses File"
+let currentFileName = "";
+
+// Statuses considered "not tested" (mirror SKIP_STATUSES in Python)
+const SKIP_STATUSES = ["tidak dites", "tidak ditest"];
 
 // =============================================================================
-// FILE UPLOAD & DRAG/DROP
+// REMARKS PARSER - Split Remarks into URL / Headers / Request Body / Response
+// Mirrors RemarksParser in generate_uat_docs.py
 // =============================================================================
 
-// PENTING: Prevent browser default drag behavior di seluruh halaman
-// Tanpa ini, drag file ke browser akan membuka file di tab baru
-document.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-});
-document.addEventListener('drop', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-});
+const RemarksParser = {
+    parse(remarksText) {
+        const result = {
+            url: "",
+            headers: "",
+            request_body: "",
+            response: "",
+            full_request: "",
+            full_response: ""
+        };
 
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('fileInput');
-const fileInfo = document.getElementById('fileInfo');
+        if (!remarksText || String(remarksText).trim() === "") {
+            return result;
+        }
 
-dropZone.addEventListener('click', () => fileInput.click());
-dropZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropZone.classList.add('dragover');
-});
-dropZone.addEventListener('dragleave', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropZone.classList.remove('dragover');
-});
-dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dropZone.classList.remove('dragover');
-    const file = e.dataTransfer.files[0];
-    if (file) handleFile(file);
-});
-fileInput.addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (file) handleFile(file);
-});
+        const text = String(remarksText).trim();
 
-function handleFile(file) {
-    if (!file.name.match(/\.xlsx?$/i)) {
-        alert('Format file harus .xlsx atau .xls');
-        return;
-    }
+        const [requestPart, responsePart] = RemarksParser._splitRequestResponse(text);
 
-    dropZone.classList.add('has-file');
-    dropZone.querySelector('.drop-zone-icon').textContent = '✅';
-    dropZone.querySelector('.drop-zone-text').innerHTML = `<strong>${file.name}</strong><br><small>File berhasil dimuat</small>`;
+        if (requestPart) {
+            const { url, headers, body } = RemarksParser._parseRequestSection(requestPart);
+            result.url = url;
+            result.headers = headers;
+            result.request_body = body;
+            result.full_request = RemarksParser._formatRequestOutput(url, headers, body);
+        }
 
-    fileInfo.textContent = `File: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
-    fileInfo.classList.add('show');
+        if (responsePart) {
+            result.response = responsePart.trim();
+            result.full_response = responsePart.trim();
+        }
 
-    const reader = new FileReader();
-    reader.onload = (e) => {
-        parseExcel(e.target.result);
-    };
-    reader.readAsArrayBuffer(file);
-}
+        return result;
+    },
 
-// =============================================================================
-// EXCEL PARSER
-// =============================================================================
-
-function parseExcel(data) {
-    const workbook = XLSX.read(data, { type: 'array' });
-    const sheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[sheetName];
-    const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-
-    // Extract metadata from header rows (first 6 rows)
-    for (let i = 0; i < Math.min(6, jsonData.length); i++) {
-        const row = jsonData[i];
-        if (!row) continue;
-        for (let j = 0; j < row.length; j++) {
-            const cellValue = String(row[j] || '');
-            if (cellValue.includes('Nama Penyedia')) {
-                metadata.nama_penyedia = extractValue(cellValue, row, j);
-            } else if (cellValue.includes('Nama Layanan')) {
-                metadata.nama_layanan = extractValue(cellValue, row, j);
-            } else if (cellValue.includes('Nama Pengguna')) {
-                metadata.nama_pengguna = extractValue(cellValue, row, j);
-            } else if (cellValue.includes('Tanggal')) {
-                metadata.tanggal_pengujian = extractValue(cellValue, row, j);
+    _splitRequestResponse(text) {
+        // Pattern 1: explicit "Response:" label
+        const responseMarkers = [
+            /\nResponse:\s*\n/,
+            /\nResponse:\s*$/m,
+            /^Response:\s*\n/
+        ];
+        for (const pattern of responseMarkers) {
+            const match = text.match(pattern);
+            if (match) {
+                const start = match.index;
+                const end = match.index + match[0].length;
+                return [text.slice(0, start).trim(), text.slice(end).trim()];
             }
         }
-    }
 
-    // Find header row
-    let headerRowIdx = -1;
-    for (let i = 0; i < jsonData.length; i++) {
-        const row = jsonData[i];
-        if (!row) continue;
-        const rowLower = row.map(c => String(c || '').toLowerCase().trim());
-        if (rowLower.includes('no') && rowLower.includes('service')) {
-            headerRowIdx = i;
-            break;
+        // Pattern 2: request JSON body immediately followed by an HTTP status line
+        const jsonThenHttp = text.match(/\}\s*\n\s*\n*(HTTP\/\d\.\d\s+\d+)/);
+        if (jsonThenHttp) {
+            const splitPos = jsonThenHttp.index + jsonThenHttp[0].indexOf(jsonThenHttp[1]);
+            return [text.slice(0, splitPos).trim(), text.slice(splitPos).trim()];
         }
-    }
 
-    if (headerRowIdx === -1) {
-        alert('ERROR: Tidak dapat menemukan header row (No, Service, Scenario...) di Excel.');
-        return;
-    }
-
-    // Parse scenarios
-    parsedScenarios = [];
-    for (let i = headerRowIdx + 1; i < jsonData.length; i++) {
-        const row = jsonData[i];
-        if (!row || !row[0] || String(row[0]).trim() === '') continue;
-
-        const scenario = {
-            no: String(row[0] || '').trim(),
-            service: String(row[1] || '').trim(),
-            scenario: String(row[2] || '').trim(),
-            expected_result: String(row[3] || '').trim(),
-            request: String(row[4] || '').trim(),
-            response: String(row[5] || '').trim(),
-            result: String(row[6] || '').trim(),
-            notes: String(row[7] || '').trim()
-        };
-        parsedScenarios.push(scenario);
-    }
-
-    // Auto-detect skipped scenarios
-    skippedSet = new Set();
-    parsedScenarios.forEach(s => {
-        if (s.notes && (s.notes.toLowerCase().includes('tidak dites') || s.notes.toLowerCase().includes('tidak dilakukan'))) {
-            skippedSet.add(s.no);
+        // Pattern 3: any HTTP response status line
+        const httpResponse = text.match(/\n(HTTP\/\d\.\d\s+\d+\s*\n)/);
+        if (httpResponse) {
+            const start = httpResponse.index + 1; // keep after the leading \n
+            return [text.slice(0, start).trim(), text.slice(start).trim()];
         }
-    });
 
-    // Update UI
-    document.getElementById('configCard').style.display = 'block';
-    document.getElementById('namaPengguna').value = metadata.nama_pengguna || '';
-    document.getElementById('tanggalPengujian').value = metadata.tanggal_pengujian || '';
-    document.getElementById('skippedScenarios').value = Array.from(skippedSet).join(', ');
+        // No response section (e.g. notification scenario) - all request
+        return [text, ""];
+    },
 
-    // Validate and show results
-    validateAndShowResults();
+    _parseRequestSection(requestText) {
+        let url = "";
+        let headers = "";
+        let body = "";
+
+        const lines = requestText.split('\n');
+
+        // Skip a leading "URL:" / "Request:" label line
+        let startIdx = 0;
+        if (lines.length && /^(URL|Request)\s*:\s*$/i.test(lines[0].trim())) {
+            startIdx = 1;
+        }
+
+        // Find the HTTP method line: "POST /path HTTP/1.1"
+        let httpMethodIdx = -1;
+        for (let i = startIdx; i < lines.length; i++) {
+            if (/^(POST|GET|PUT|DELETE|PATCH)\s+\//.test(lines[i].trim())) {
+                httpMethodIdx = i;
+                break;
+            }
+        }
+
+        if (httpMethodIdx >= 0) {
+            const urlLine = lines[httpMethodIdx].trim();
+
+            // Find Host header to build the full URL
+            let host = "";
+            for (let i = httpMethodIdx + 1; i < lines.length; i++) {
+                if (lines[i].trim().toLowerCase().startsWith('host:')) {
+                    host = lines[i].trim().split(':').slice(1).join(':').trim();
+                    break;
+                }
+            }
+
+            const methodMatch = urlLine.match(/(POST|GET|PUT|DELETE|PATCH)\s+(\S+)/);
+            if (methodMatch && host) {
+                url = `URL:\n${methodMatch[1]} https://${host}${methodMatch[2]}`;
+            } else {
+                url = `URL:\n${urlLine}`;
+            }
+
+            // Collect header lines after the method line until blank line or JSON body
+            const headerLines = [];
+            let bodyStartIdx = -1;
+            for (let i = httpMethodIdx + 1; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line.toLowerCase().startsWith('host:')) continue; // already in URL
+                if (line === '') { bodyStartIdx = i + 1; break; }
+                if (line.startsWith('{')) { bodyStartIdx = i; break; }
+                if (/^[\w-]+[\w-]*\s*:/.test(line)) headerLines.push(line);
+            }
+
+            if (bodyStartIdx >= 0 && bodyStartIdx < lines.length) {
+                let bodyText = lines.slice(bodyStartIdx).join('\n').trim();
+                if (bodyText) {
+                    const jsonStart = bodyText.indexOf('{');
+                    if (jsonStart >= 0) {
+                        bodyText = bodyText.slice(jsonStart);
+                        body = RemarksParser._extractJsonObject(bodyText);
+                    }
+                }
+            }
+
+            headers = headerLines.join('\n').trim();
+        } else {
+            // No HTTP method line - notification format:
+            //   "URL: https://..." then headers then a JSON body
+            const headerLines = [];
+            let bodyStart = -1;
+            for (let i = startIdx; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line.startsWith('{')) { bodyStart = i; break; }
+                if (line === '') continue;
+                if (/^url\s*:\s*\S/i.test(line)) {
+                    const urlValue = line.split(':').slice(1).join(':').trim();
+                    url = `URL:\n${urlValue}`;
+                } else if (/^[\w-]+[\w-]*\s*:/.test(line)) {
+                    headerLines.push(line);
+                }
+            }
+            headers = headerLines.join('\n').trim();
+            if (bodyStart >= 0) {
+                const bodyText = lines.slice(bodyStart).join('\n').trim();
+                body = RemarksParser._extractJsonObject(bodyText);
+            }
+        }
+
+        return { url, headers, body };
+    },
+
+    _extractJsonObject(text) {
+        // Return the first balanced {...} JSON object, else the whole text
+        let braceCount = 0;
+        let jsonEnd = -1;
+        for (let i = 0; i < text.length; i++) {
+            if (text[i] === '{') braceCount++;
+            else if (text[i] === '}') {
+                braceCount--;
+                if (braceCount === 0) { jsonEnd = i + 1; break; }
+            }
+        }
+        return jsonEnd > 0 ? text.slice(0, jsonEnd) : text;
+    },
+
+    _formatRequestOutput(url, headers, body) {
+        const parts = [];
+        if (url) parts.push(url);
+        if (headers) parts.push(`\n${headers}`);
+        if (body) parts.push(`\nRequest Body:\n${body}`);
+        return parts.join('\n').trim();
+    }
+};
+
+// =============================================================================
+// RESPONSE PARSER - Extract responseCode from full HTTP response
+// Mirrors ResponseParser.extract_response_code in generate_uat_docs.py
+// =============================================================================
+
+const ResponseParser = {
+    extractResponseCode(responseText) {
+        if (!responseText) return null;
+        const patterns = [
+            /"responseCode"\s*:\s*"(\d+)"/,
+            /"responseCode"\s*:\s*(\d+)/,
+            /responseCode["\s:]*(\d{7})/
+        ];
+        for (const pattern of patterns) {
+            const match = responseText.match(pattern);
+            if (match) return match[1];
+        }
+        return null;
+    }
+};
+
+// =============================================================================
+// SCENARIO NAME CLEANER - Mirrors clean_scenario_name in generate_uat_docs.py
+// =============================================================================
+
+function cleanScenarioName(langkahTes) {
+    if (!langkahTes) return "";
+    let cleaned = String(langkahTes);
+    // Remove leading number prefix like "18,1 " or "3.5 "
+    cleaned = cleaned.replace(/^\d+[,.]\d+\s*/, '');
+    // Remove marker/comment artifacts (a line of ===== and everything after it)
+    cleaned = cleaned.replace(/\n[\s\S]*?======[\s\S]*/, '');
+    return cleaned.trim();
 }
 
-function extractValue(cellValue, row, colIdx) {
-    if (cellValue.includes(':')) {
-        const parts = cellValue.split(':');
-        if (parts.length > 1 && parts.slice(1).join(':').trim()) {
-            return parts.slice(1).join(':').trim();
-        }
-    }
-    // Try next column
-    if (row[colIdx + 1]) {
-        return String(row[colIdx + 1]).trim();
-    }
-    return '';
+function extractAspiNumber(langkahTes) {
+    if (!langkahTes) return "";
+    const match = String(langkahTes).match(/(\d+)[,.](\d+)/);
+    return match ? `${match[1]}.${match[2]}` : "";
 }
 
 // =============================================================================
-// VALIDATION LOGIC
+// VALIDATION LOGIC - Mirrors ResultValidator in generate_uat_docs.py
 // =============================================================================
 
 function extractExpectedCode(expectedText) {
@@ -208,502 +281,876 @@ function extractExpectedCode(expectedText) {
     return null;
 }
 
+// Kept for backward compatibility with the results table display.
 function extractResponseCode(responseText) {
-    if (!responseText) return null;
-    const patterns = [
-        /"responseCode"\s*:\s*"(\d+)"/,
-        /"httpCode"\s*:\s*(\d+)/,
-        /"responseCode"\s*:\s*(\d+)/,
-        /responseCode.*?(\d{7})/,
-        /[Cc]ode.*?(\d{7})/
-    ];
-    for (const pattern of patterns) {
-        const match = responseText.match(pattern);
-        if (match) return match[1];
-    }
-    return null;
+    return ResponseParser.extractResponseCode(responseText);
 }
 
+function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Validate a scenario -> 'PASS' | 'NOT PASS' | 'N/A' | 'NOT TESTED'.
+ *
+ * ASPI status rules (mirror ResultValidator.validate in Python):
+ *   - PASS      : actual responseCode matches expected (incl. 'xx' wildcard).
+ *   - NOT PASS  : actual responseCode present but does not match expected.
+ *   - N/A       : scenario 'Tidak dites'/'Tidak ditest' (skipped), OR a
+ *                 functional 'Berhasil' scenario whose expected result has no
+ *                 extractable code and carries no Remarks payload, OR a
+ *                 notification-format 'Berhasil' scenario with a request
+ *                 payload but no Response section to validate.
+ *   - NOT TESTED: expected an API code and had response data but the code
+ *                 could not be extracted, or no response at all while not
+ *                 skipped/functional.
+ */
 function validateScenario(scenario) {
-    // If already filled by mitra
-    if (scenario.result && ['PASS', 'NOT PASS', 'N/A'].includes(scenario.result.toUpperCase())) {
-        return scenario.result.toUpperCase();
+    if (scenario.is_skipped) return "N/A";
+
+    const expectedCode = extractExpectedCode(scenario.expected_result || "");
+    const actualCode = ResponseParser.extractResponseCode(scenario.response || "");
+    const hasResponse = !!(scenario.response && String(scenario.response).trim());
+    const hasRemarksPayload = !!(
+        (scenario.request && String(scenario.request).trim()) || hasResponse
+    );
+    const isBerhasil = String(scenario.hasil_aktual || "").toLowerCase() === "berhasil";
+
+    // No response payload at all.
+    if (!hasResponse) {
+        if (isBerhasil && expectedCode === null && !hasRemarksPayload) return "N/A";
+        if (isBerhasil && hasRemarksPayload) return "N/A";
+        return "NOT TESTED";
     }
 
-    // If no response provided
-    if (!scenario.response || scenario.response === '' || scenario.response === 'Response Body:') {
-        return 'NOT TESTED';
+    // Response payload present but codes missing.
+    if (!expectedCode || !actualCode) {
+        if (expectedCode === null && isBerhasil) return "N/A";
+        return "NOT TESTED";
     }
 
-    const expectedCode = extractExpectedCode(scenario.expected_result);
-    const actualCode = extractResponseCode(scenario.response);
+    // xx wildcard - anchor fully so 401xx01 matches exactly 4014701 (7 digits).
+    if (expectedCode.includes("xx")) {
+        const pattern = "^" + escapeRegExp(expectedCode).replace(/xx/g, "\\d{2}") + "$";
+        return new RegExp(pattern).test(actualCode) ? "PASS" : "NOT PASS";
+    }
 
-    if (!expectedCode || !actualCode) return 'NOT TESTED';
+    return expectedCode === actualCode ? "PASS" : "NOT PASS";
+}
 
-    // Handle xx pattern
-    if (expectedCode.includes('xx')) {
-        const regexPattern = expectedCode.replace('xx', '\\d{2}');
-        if (new RegExp('^' + regexPattern + '$').test(actualCode)) {
-            return 'PASS';
-        } else {
-            return 'NOT PASS';
+// =============================================================================
+// EXCEL PARSER - flexible header detection + name-based column mapping
+// Mirrors UATScriptParser in generate_uat_docs.py
+// =============================================================================
+
+function firstLine(v) {
+    return v ? String(v).split('\n')[0].trim() : '';
+}
+
+function pickWorksheet(workbook) {
+    // Prefer a sheet named like "UAT Script" (matches Python selection logic).
+    for (const name of workbook.SheetNames) {
+        const lower = name.toLowerCase();
+        if (lower.includes('uat') && lower.includes('script')) return name;
+        if (lower.trim() === 'uat script') return name;
+        if (lower.includes('script') && !lower.includes('error')) return name;
+    }
+    return workbook.SheetNames[0];
+}
+
+/**
+ * Detect header row + build a column map by header NAME.
+ * Returns { headerRowIdx, colMap } or { headerRowIdx: -1 } if not found.
+ */
+function findHeaderRow(rows) {
+    const maxScan = Math.min(50, rows.length);
+
+    // Primary: Indonesian (Kirimo) layout.
+    for (let i = 0; i < maxScan; i++) {
+        const row = rows[i];
+        if (!row) continue;
+        const firstLines = row.map(c => firstLine(c).toLowerCase());
+
+        const hasLangkah = firstLines.some(fl => fl.includes('langkah tes') || fl === 'langkah tes');
+        const hasKategori = firstLines.some(fl => fl.includes('kategori'));
+        const hasNamaModul = firstLines.some(fl => fl.includes('nama modul'));
+        const hasHasil = firstLines.some(fl => fl.includes('hasil') && fl.includes('diharapkan'));
+        const hasNomorKasus = firstLines.some(fl => fl.includes('nomor kasus') || fl.includes('kasus tes'));
+
+        if (hasLangkah && (hasKategori || hasNamaModul || hasHasil || hasNomorKasus)) {
+            const colMap = {};
+            firstLines.forEach((fl, idx) => {
+                if (fl === 'kategori' || (fl.startsWith('kategori') && !fl.includes('nama'))) colMap.kategori = idx;
+                else if (fl.includes('nama modul')) colMap.nama_modul = idx;
+                else if (fl.includes('nomor skenario')) colMap.nomor_skenario = idx;
+                else if (fl.includes('nomor kasus') || fl.includes('kasus tes')) colMap.nomor_kasus_tes = idx;
+                else if (fl.includes('langkah')) colMap.langkah_tes = idx;
+                else if (fl.includes('hasil') && fl.includes('diharapkan')) colMap.hasil_diharapkan = idx;
+                else if (fl.includes('hasil aktual')) colMap.hasil_aktual = idx;
+                else if (fl.includes('remark')) colMap.remarks = idx;
+                else if (fl.includes('tanggal') && fl.includes('pelaksanaan')) colMap.tanggal = idx;
+                else if (fl.includes('jenis') && fl.includes('script')) colMap.jenis_script = idx;
+                else if (fl.includes('pelaksana')) colMap.pelaksana = idx;
+            });
+            return { headerRowIdx: i, colMap, layout: 'id' };
         }
     }
 
-    // Direct comparison
-    return expectedCode === actualCode ? 'PASS' : 'NOT PASS';
-}
+    // Secondary: old English layout
+    //   No | Service | Scenario | Expected Result | Request | Response | Result | Notes
+    for (let i = 0; i < maxScan; i++) {
+        const row = rows[i];
+        if (!row) continue;
+        const firstLines = row.map(c => firstLine(c).toLowerCase());
 
-function isScenarioSkipped(scenario) {
-    if ((!scenario.request || scenario.request === '') && (!scenario.response || scenario.response === '')) {
-        if (scenario.notes && scenario.notes.toLowerCase().includes('tidak')) return true;
-        if (skippedSet.has(scenario.no)) return true;
+        const hasScenario = firstLines.some(fl => fl === 'scenario');
+        const hasExpected = firstLines.some(fl => fl.includes('expected') && fl.includes('result'));
+        const hasService = firstLines.some(fl => fl === 'service');
+
+        if (hasScenario && hasExpected && hasService) {
+            const colMap = {};
+            firstLines.forEach((fl, idx) => {
+                if (fl === 'service') colMap.nama_modul = idx;
+                else if (fl === 'scenario') colMap.langkah_tes = idx;
+                else if (fl.includes('expected') && fl.includes('result')) colMap.hasil_diharapkan = idx;
+                else if (fl === 'request') colMap.request = idx;
+                else if (fl === 'response') colMap.remarks = idx;
+                else if (fl === 'result') colMap.hasil_aktual = idx;
+                else if (fl === 'notes') colMap.notes = idx;
+                else if (fl === 'no') colMap.nomor_kasus_tes = idx;
+            });
+            // If no explicit Response column, use Notes as remarks source.
+            if (colMap.remarks === undefined && colMap.notes !== undefined) {
+                colMap.remarks = colMap.notes;
+            }
+            return { headerRowIdx: i, colMap, layout: 'en' };
+        }
     }
-    return false;
+
+    return { headerRowIdx: -1, colMap: {}, layout: null };
+}
+
+const SECTION_KEYWORDS = [
+    "Balance Services", "API Transaction History",
+    "QR MPM", "PENGECEKAN MUTASI", "Generate QR SNAP",
+    "Refund Payment", "Query Payment", "Inquiry"
+];
+
+/**
+ * Parse a workbook's data array into structured scenarios.
+ * Pure function so it can be unit-tested headless. Returns
+ * { scenarios, metadata, headerRowIdx, layout, error }.
+ */
+function parseWorkbookData(rows) {
+    const meta = {
+        nama_penyedia: "Bank Sahabat Sampoerna",
+        nama_layanan: "API QR MPM",
+        nama_pengguna: "",
+        tanggal_pengujian: ""
+    };
+
+    // --- Metadata extraction (mitra name in <...>, Tanggal, Nomor Referensi) ---
+    for (let i = 0; i < Math.min(20, rows.length); i++) {
+        const row = rows[i];
+        if (!row) continue;
+        for (let j = 0; j < row.length; j++) {
+            const val = String(row[j] || '').trim();
+            if (!val) continue;
+            if (val.includes('<') && val.includes('>')) {
+                const m = val.match(/<(.+?)>/);
+                if (m) {
+                    const mitra = m[1].match(/((?:PT|CV)\s+[\w\s]+(?:\([^)]+\))?)/);
+                    if (mitra) meta.nama_pengguna = mitra[0].trim();
+                }
+            }
+            if (val.includes('Nama Penyedia')) {
+                const v = extractInlineValue(val, row, j);
+                if (v) meta.nama_penyedia = v;
+            } else if (val.includes('Nama Layanan')) {
+                const v = extractInlineValue(val, row, j);
+                if (v) meta.nama_layanan = v;
+            } else if (val.includes('Nama Pengguna')) {
+                const v = extractInlineValue(val, row, j);
+                if (v) meta.nama_pengguna = v;
+            } else if (val.includes('Tanggal') && !val.includes('Pelaksanaan')) {
+                const v = extractInlineValue(val, row, j);
+                if (v) meta.tanggal_pengujian = v;
+            }
+        }
+    }
+
+    const { headerRowIdx, colMap, layout } = findHeaderRow(rows);
+    if (headerRowIdx === -1) {
+        return { scenarios: [], metadata: meta, headerRowIdx: -1, layout: null, error: 'no-header' };
+    }
+
+    const get = (row, key, dflt) => {
+        const idx = colMap[key];
+        if (idx === undefined) return "";
+        const v = row[idx];
+        return v === undefined || v === null ? "" : String(v).trim();
+    };
+
+    const scenarios = [];
+    let currentSection = "";
+
+    for (let i = headerRowIdx + 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row) continue;
+
+        // Skip completely empty rows
+        if (row.every(v => v === undefined || v === null || String(v).trim() === "")) continue;
+
+        const kategori = get(row, 'kategori', '');
+        const namaModul = get(row, 'nama_modul', '');
+        const langkahTes = get(row, 'langkah_tes', '');
+
+        // Section header detection (row naming a section, no test step)
+        let isSectionHeader = false;
+        for (const kw of SECTION_KEYWORDS) {
+            const kwl = kw.toLowerCase();
+            if (kategori.toLowerCase().includes(kwl) || namaModul.toLowerCase().includes(kwl)) {
+                if (!langkahTes) {
+                    currentSection = kategori || namaModul;
+                    isSectionHeader = true;
+                    break;
+                }
+            }
+        }
+        if (isSectionHeader) continue;
+
+        const nomorKasus = get(row, 'nomor_kasus_tes', '');
+        if (!nomorKasus && !langkahTes) continue;
+
+        const hasilAktual = get(row, 'hasil_aktual', '');
+        const remarksRaw = get(row, 'remarks', '');
+        const parsed = RemarksParser.parse(remarksRaw);
+
+        const scenario = {
+            section: currentSection,
+            kategori: kategori,
+            nama_modul: namaModul,
+            nomor_skenario: get(row, 'nomor_skenario', ''),
+            nomor_kasus_tes: nomorKasus,
+            langkah_tes: langkahTes,
+            aspi_no: extractAspiNumber(langkahTes),
+            scenario_name: cleanScenarioName(langkahTes),
+            expected_result: get(row, 'hasil_diharapkan', ''),
+            hasil_aktual: hasilAktual,
+            remarks_raw: remarksRaw,
+            url: parsed.url,
+            headers: parsed.headers,
+            request_body: parsed.request_body,
+            request: parsed.full_request,
+            response: parsed.full_response,
+            is_skipped: SKIP_STATUSES.includes(hasilAktual.toLowerCase())
+        };
+        scenarios.push(scenario);
+    }
+
+    return { scenarios, metadata: meta, headerRowIdx, layout, error: null };
+}
+
+function extractInlineValue(cellValue, row, colIdx) {
+    if (cellValue.includes(':')) {
+        const parts = cellValue.split(':');
+        const rest = parts.slice(1).join(':').trim();
+        if (rest) return rest;
+    }
+    if (row[colIdx + 1]) return String(row[colIdx + 1]).trim();
+    return '';
 }
 
 // =============================================================================
-// RESULTS DISPLAY
+// BROWSER-ONLY CODE (DOM, docx generation). Guarded so headless tests skip it.
 // =============================================================================
 
-function validateAndShowResults() {
-    const resultsCard = document.getElementById('resultsCard');
-    const generateCard = document.getElementById('generateCard');
-    const resultsBody = document.getElementById('resultsBody');
-    const summaryCards = document.getElementById('summaryCards');
+const IS_BROWSER = typeof window !== 'undefined' && typeof document !== 'undefined';
 
-    resultsCard.style.display = 'block';
-    generateCard.style.display = 'block';
+if (IS_BROWSER) {
 
-    let passed = 0, failed = 0, na = 0, notTested = 0;
+    // ---- Global error handlers ---------------------------------------------
+    window.onerror = function (msg, url, line) {
+        console.error('Error:', msg, 'at', url, ':', line);
+        alert('Terjadi error: ' + msg + '\n\nLine: ' + line + '\nSilakan buka Console (F12) untuk detail.');
+        return false;
+    };
+    window.addEventListener('unhandledrejection', function (event) {
+        console.error('Unhandled promise rejection:', event.reason);
+        alert('Terjadi error async: ' + ((event.reason && event.reason.message) || event.reason) + '\n\nSilakan buka Console (F12) untuk detail.');
+    });
 
-    resultsBody.innerHTML = '';
-    parsedScenarios.forEach(s => {
-        const isSkipped = isScenarioSkipped(s);
-        let result;
-        if (isSkipped) {
-            result = 'N/A';
-            na++;
-        } else {
-            result = validateScenario(s);
+    // ---- Prevent browser default drag behavior -----------------------------
+    document.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
+    document.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); });
+
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const fileInfo = document.getElementById('fileInfo');
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        dropZone.classList.add('dragover');
+    });
+    dropZone.addEventListener('dragleave', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        dropZone.classList.remove('dragover');
+    });
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        dropZone.classList.remove('dragover');
+        const file = e.dataTransfer.files[0];
+        if (file) handleFile(file);
+    });
+    fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) handleFile(file);
+    });
+
+    // ---- File handling -----------------------------------------------------
+    // Loading a file no longer auto-parses; it stores the data and reveals the
+    // "Proses File" / "Hapus File" buttons so the user triggers processing.
+    function handleFile(file) {
+        if (!file.name.match(/\.xlsx?$/i)) {
+            alert('Format file harus .xlsx atau .xls');
+            return;
+        }
+
+        currentFileName = file.name;
+        dropZone.classList.add('has-file');
+        dropZone.querySelector('.drop-zone-icon').textContent = '✅';
+        dropZone.querySelector('.drop-zone-text').innerHTML =
+            `<strong>${file.name}</strong><br><small>File siap diproses. Klik "Proses File".</small>`;
+
+        fileInfo.textContent = `File: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+        fileInfo.classList.add('show');
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            currentFileData = e.target.result;
+            showFileActions(true);
+        };
+        reader.readAsArrayBuffer(file);
+    };
+
+    // ---- Proses File button ------------------------------------------------
+    function processFile() {
+        if (!currentFileData) {
+            alert('Belum ada file yang dimuat. Silakan upload file UAT Script Excel terlebih dahulu.');
+            return;
+        }
+        parseExcel(currentFileData);
+    };
+
+    // ---- Hapus File button (reset everything) ------------------------------
+    function resetFile() {
+        currentFileData = null;
+        currentFileName = "";
+        parsedScenarios = [];
+        skippedSet = new Set();
+        metadata = {
+            nama_penyedia: "Bank Sahabat Sampoerna",
+            nama_layanan: "API QR MPM",
+            nama_pengguna: "",
+            tanggal_pengujian: ""
+        };
+
+        if (fileInput) fileInput.value = '';
+
+        // Reset drop zone to its initial look
+        dropZone.classList.remove('has-file', 'dragover');
+        dropZone.querySelector('.drop-zone-icon').textContent = '📄';
+        dropZone.querySelector('.drop-zone-text').innerHTML =
+            '<strong>Drag & Drop</strong> file UAT Script Excel (.xlsx) di sini<br><small>atau klik untuk memilih file</small>';
+
+        if (fileInfo) { fileInfo.textContent = ''; fileInfo.classList.remove('show'); }
+
+        // Hide action buttons and the downstream cards
+        showFileActions(false);
+        const configCard = document.getElementById('configCard');
+        const resultsCard = document.getElementById('resultsCard');
+        const generateCard = document.getElementById('generateCard');
+        if (configCard) configCard.style.display = 'none';
+        if (resultsCard) resultsCard.style.display = 'none';
+        if (generateCard) generateCard.style.display = 'none';
+
+        const logArea = document.getElementById('logArea');
+        if (logArea) { logArea.innerHTML = ''; logArea.style.display = 'none'; }
+    };
+
+    function showFileActions(show) {
+        const actions = document.getElementById('fileActions');
+        if (actions) actions.style.display = show ? 'flex' : 'none';
+    }
+
+    // ---- Excel parsing (browser entry point) -------------------------------
+    function parseExcel(data) {
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = pickWorksheet(workbook);
+        const worksheet = workbook.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' });
+
+        const result = parseWorkbookData(rows);
+
+        if (result.error === 'no-header') {
+            alert('ERROR: Tidak dapat menemukan header row di Excel.\n\n' +
+                  'Format yang didukung:\n' +
+                  '- Kirimo (Indonesia): Kategori, Nama Modul, Langkah Tes, Hasil yang diharapkan, Remarks, ...\n' +
+                  '- Lama (English): No, Service, Scenario, Expected Result, Request, Response, Result, Notes');
+            return;
+        }
+
+        parsedScenarios = result.scenarios;
+
+        // Merge detected metadata (do not overwrite non-empty defaults with blanks)
+        if (result.metadata.nama_pengguna) metadata.nama_pengguna = result.metadata.nama_pengguna;
+        if (result.metadata.tanggal_pengujian) metadata.tanggal_pengujian = result.metadata.tanggal_pengujian;
+        if (result.metadata.nama_penyedia) metadata.nama_penyedia = result.metadata.nama_penyedia;
+        if (result.metadata.nama_layanan) metadata.nama_layanan = result.metadata.nama_layanan;
+
+        // Auto-detect skipped scenarios (is_skipped from hasil_aktual)
+        skippedSet = new Set();
+        parsedScenarios.forEach(s => {
+            if (s.is_skipped) skippedSet.add(s.nomor_kasus_tes || s.aspi_no);
+        });
+
+        // Update config UI
+        document.getElementById('configCard').style.display = 'block';
+        document.getElementById('namaPengguna').value = metadata.nama_pengguna || '';
+        document.getElementById('tanggalPengujian').value = metadata.tanggal_pengujian || '';
+        document.getElementById('skippedScenarios').value = Array.from(skippedSet).filter(Boolean).join(', ');
+
+        addLog(`File diproses: ${parsedScenarios.length} skenario ditemukan (header baris ${result.headerRowIdx + 1}, layout ${result.layout}).`, 'info');
+
+        validateAndShowResults();
+    };
+
+    // ---- Results display ---------------------------------------------------
+    function validateAndShowResults() {
+        const resultsCard = document.getElementById('resultsCard');
+        const generateCard = document.getElementById('generateCard');
+        const resultsBody = document.getElementById('resultsBody');
+        const summaryCards = document.getElementById('summaryCards');
+
+        resultsCard.style.display = 'block';
+        generateCard.style.display = 'block';
+
+        let passed = 0, failed = 0, na = 0, notTested = 0;
+        resultsBody.innerHTML = '';
+
+        parsedScenarios.forEach(s => {
+            const result = validateScenario(s);
             if (result === 'PASS') passed++;
             else if (result === 'NOT PASS') failed++;
+            else if (result === 'N/A') na++;
             else notTested++;
-        }
 
-        const expectedCode = extractExpectedCode(s.expected_result) || '-';
-        const actualCode = extractResponseCode(s.response) || '-';
+            const expectedCode = extractExpectedCode(s.expected_result) || '-';
+            const actualCode = ResponseParser.extractResponseCode(s.response) || '-';
 
-        let badgeClass = 'badge-pending';
-        if (result === 'PASS') badgeClass = 'badge-pass';
-        else if (result === 'NOT PASS') badgeClass = 'badge-fail';
-        else if (result === 'N/A') badgeClass = 'badge-na';
+            let badgeClass = 'badge-pending';
+            if (result === 'PASS') badgeClass = 'badge-pass';
+            else if (result === 'NOT PASS') badgeClass = 'badge-fail';
+            else if (result === 'N/A') badgeClass = 'badge-na';
 
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td>${s.no}</td>
-            <td>${s.service}</td>
-            <td>${s.scenario.substring(0, 50)}${s.scenario.length > 50 ? '...' : ''}</td>
-            <td><code>${expectedCode}</code></td>
-            <td><code>${actualCode}</code></td>
-            <td><span class="badge ${badgeClass}">${result}</span></td>
-            <td>${s.notes ? s.notes.substring(0, 30) + '...' : ''}</td>
+            const name = s.scenario_name || s.langkah_tes || '';
+            const noLabel = s.aspi_no || s.nomor_kasus_tes || '';
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${escapeHtml(noLabel)}</td>
+                <td>${escapeHtml(s.nama_modul)}</td>
+                <td>${escapeHtml(name.substring(0, 50))}${name.length > 50 ? '...' : ''}</td>
+                <td><code>${escapeHtml(expectedCode)}</code></td>
+                <td><code>${escapeHtml(actualCode)}</code></td>
+                <td><span class="badge ${badgeClass}">${result}</span></td>
+                <td>${escapeHtml((s.hasil_aktual || '').substring(0, 30))}</td>
+            `;
+            resultsBody.appendChild(row);
+        });
+
+        const total = parsedScenarios.length;
+        summaryCards.innerHTML = `
+            <div class="summary-card total"><div class="number">${total}</div><div class="label">Total Skenario</div></div>
+            <div class="summary-card pass"><div class="number">${passed}</div><div class="label">PASS</div></div>
+            <div class="summary-card fail"><div class="number">${failed}</div><div class="label">NOT PASS</div></div>
+            <div class="summary-card na"><div class="number">${na + notTested}</div><div class="label">N/A / Belum Diisi</div></div>
         `;
-        resultsBody.appendChild(row);
-    });
 
-    const total = parsedScenarios.length;
-    summaryCards.innerHTML = `
-        <div class="summary-card total"><div class="number">${total}</div><div class="label">Total Skenario</div></div>
-        <div class="summary-card pass"><div class="number">${passed}</div><div class="label">PASS</div></div>
-        <div class="summary-card fail"><div class="number">${failed}</div><div class="label">NOT PASS</div></div>
-        <div class="summary-card na"><div class="number">${na + notTested}</div><div class="label">N/A / Belum Diisi</div></div>
-    `;
+        const denom = total - na - notTested;
+        const passRate = denom > 0 ? (passed / denom) * 100 : 0;
+        document.getElementById('progressFill').style.width = `${Math.min(passRate, 100)}%`;
+    };
 
-    const passRate = total > 0 ? ((passed / (total - na - notTested)) * 100) || 0 : 0;
-    document.getElementById('progressFill').style.width = `${Math.min(passRate, 100)}%`;
-}
+    function escapeHtml(str) {
+        return String(str == null ? '' : str)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
 
-// =============================================================================
-// DOCX GENERATION - UAT RESULT
-// =============================================================================
-
-async function generateUATResult() {
-    addLog('Generating UAT Result...', 'info');
-    updateMetadataFromUI();
-
-    const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, 
-            Table, TableRow, TableCell, WidthType, BorderStyle, 
-            ShadingType, PageBreak } = docx;
-
-    const children = [];
-
-    // Title page
-    children.push(new Paragraph({ text: '' }));
-    children.push(new Paragraph({ text: '' }));
-    children.push(new Paragraph({
-        alignment: AlignmentType.CENTER,
-        children: [new TextRun({ text: 'UAT Result', bold: true, size: 48, font: 'Calibri' })]
-    }));
-    children.push(new Paragraph({ text: '' }));
-    children.push(new Paragraph({
-        alignment: AlignmentType.CENTER,
-        children: [new TextRun({ text: 'Penambahan Layanan QRIS Merchant Aggregator', bold: true, size: 32, font: 'Calibri' })]
-    }));
-    children.push(new Paragraph({ text: '' }));
-    children.push(new Paragraph({
-        alignment: AlignmentType.CENTER,
-        children: [
-            new TextRun({ text: `Nama Penyedia Layanan: ${metadata.nama_penyedia}`, size: 22 }),
-            new TextRun({ text: `\nNama Pengguna Layanan: ${metadata.nama_pengguna}`, size: 22, break: 1 }),
-            new TextRun({ text: `\nTanggal Pengujian: ${metadata.tanggal_pengujian}`, size: 22, break: 1 }),
-        ]
-    }));
-    children.push(new Paragraph({ children: [new PageBreak()] }));
-
-    // Table of Contents
-    children.push(new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: 'Daftar Isi', bold: true })]
-    }));
-
-    const tocItems = [
-        '1  Balance Services',
-        '2  API Transaction History List',
-        '3  QR MPM',
-        '4  Pengecekan Mutasi Dan Jurnal',
-        '5  Generate QR SNAP',
-        '6  Refund Payment',
-        '7  Query Payment',
-        '8  Inquiry & Report'
-    ];
-    tocItems.forEach(item => {
-        children.push(new Paragraph({
-            indent: { left: 720 },
-            children: [new TextRun({ text: item, size: 20 })]
+    // ---- Helper: build docx paragraphs from a multi-line monospace block ----
+    // docx.js does NOT render "\n" inside a single TextRun, so each line must be
+    // its own paragraph (with a mono font). This is what makes URL / Headers /
+    // Body Request appear on separate lines in the Word document.
+    function monospaceParagraphs(text, sizeHalfPt, indentLeft) {
+        const { Paragraph, TextRun } = docx;
+        const lines = String(text || '').split('\n');
+        return lines.map(line => new Paragraph({
+            indent: indentLeft ? { left: indentLeft } : undefined,
+            spacing: { before: 0, after: 0 },
+            children: [new TextRun({ text: line, font: 'Consolas', size: sizeHalfPt })]
         }));
-    });
-    children.push(new Paragraph({ children: [new PageBreak()] }));
+    }
 
-    // Section 1 & 2: Skipped
-    children.push(new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: '1 Balance Services', bold: true })]
-    }));
-    children.push(new Paragraph({
-        children: [new TextRun({ text: 'Tidak dites karena tidak sesuai dengan kondisi produk.', italics: true })]
-    }));
-    children.push(new Paragraph({ text: '' }));
+    // Build a single table cell whose content is split across lines/paragraphs.
+    function multiLineCell(text, opts) {
+        const { Paragraph, TextRun, WidthType, AlignmentType } = docx;
+        opts = opts || {};
+        const lines = String(text == null ? '' : text).split('\n');
+        const paragraphs = lines.map(line => new Paragraph({
+            alignment: opts.alignment || AlignmentType.LEFT,
+            spacing: { before: 0, after: 0 },
+            children: [new TextRun({
+                text: line,
+                size: opts.size || 14,
+                bold: !!opts.bold,
+                color: opts.color || '000000',
+                font: opts.font || 'Calibri'
+            })]
+        }));
+        const cellOpts = { children: paragraphs.length ? paragraphs : [new Paragraph({ text: '' })] };
+        if (opts.width !== undefined) cellOpts.width = { size: opts.width, type: WidthType.DXA };
+        return new docx.TableCell(cellOpts);
+    }
 
-    children.push(new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: '2 API Transaction History List', bold: true })]
-    }));
-    children.push(new Paragraph({
-        children: [new TextRun({ text: 'Tidak dites karena tidak sesuai dengan kondisi produk.', italics: true })]
-    }));
-    children.push(new Paragraph({ children: [new PageBreak()] }));
+    // =========================================================================
+    // DOCX GENERATION - UAT RESULT
+    // =========================================================================
+    async function generateUATResult() {
+        addLog('Generating UAT Result...', 'info');
+        updateMetadataFromUI();
 
-    // Section 3: QR MPM
-    children.push(new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: '3 QR MPM', bold: true })]
-    }));
+        const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
+                Table, TableRow, TableCell, WidthType, ShadingType, PageBreak } = docx;
 
-    let subIdx = 1;
-    parsedScenarios.forEach(s => {
-        if (!s.no.startsWith('18.')) return;
+        const children = [];
 
+        children.push(new Paragraph({ text: '' }));
+        children.push(new Paragraph({ text: '' }));
         children.push(new Paragraph({
-            heading: HeadingLevel.HEADING_2,
-            children: [new TextRun({ text: `3.${subIdx} ${s.no} ${s.scenario}`, bold: true })]
+            alignment: AlignmentType.CENTER,
+            children: [new TextRun({ text: 'UAT Result', bold: true, size: 48, font: 'Calibri' })]
+        }));
+        children.push(new Paragraph({ text: '' }));
+        children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [new TextRun({ text: 'Penambahan Layanan QRIS Merchant Aggregator', bold: true, size: 32, font: 'Calibri' })]
+        }));
+        children.push(new Paragraph({ text: '' }));
+        children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [
+                new TextRun({ text: `Nama Penyedia Layanan: ${metadata.nama_penyedia}`, size: 22 }),
+                new TextRun({ text: `Nama Pengguna Layanan: ${metadata.nama_pengguna}`, size: 22, break: 1 }),
+                new TextRun({ text: `Tanggal Pengujian: ${metadata.tanggal_pengujian}`, size: 22, break: 1 })
+            ]
+        }));
+        children.push(new Paragraph({ children: [new PageBreak()] }));
+
+        // Detail per scenario
+        children.push(new Paragraph({
+            heading: HeadingLevel.HEADING_1,
+            children: [new TextRun({ text: 'Detail Hasil Pengujian', bold: true })]
         }));
 
-        const isSkipped = isScenarioSkipped(s);
-        if (isSkipped) {
+        parsedScenarios.forEach((s, idx) => {
+            const name = s.scenario_name || s.langkah_tes || '';
+            const noLabel = s.aspi_no || s.nomor_kasus_tes || String(idx + 1);
             children.push(new Paragraph({
-                children: [new TextRun({ text: 'Tidak dites karena tidak sesuai dengan kondisi produk.', italics: true })]
-            }));
-        } else {
-            // Expected Result
-            children.push(new Paragraph({
-                children: [
-                    new TextRun({ text: 'Expected Result: ', bold: true, size: 20 }),
-                    new TextRun({ text: s.expected_result, size: 20 })
-                ]
+                heading: HeadingLevel.HEADING_2,
+                children: [new TextRun({ text: `${noLabel} ${name}`, bold: true })]
             }));
 
-            // Request
-            children.push(new Paragraph({
-                children: [new TextRun({ text: 'Request:', bold: true, size: 20 })]
-            }));
-            if (s.request) {
+            if (s.is_skipped) {
                 children.push(new Paragraph({
-                    indent: { left: 720 },
-                    children: [new TextRun({ text: s.request, font: 'Consolas', size: 16 })]
+                    children: [new TextRun({ text: 'Tidak dites karena tidak sesuai dengan kondisi produk.', italics: true })]
                 }));
-            }
-
-            // Response
-            children.push(new Paragraph({
-                children: [new TextRun({ text: 'Response:', bold: true, size: 20 })]
-            }));
-            if (s.response) {
-                children.push(new Paragraph({
-                    indent: { left: 720 },
-                    children: [new TextRun({ text: s.response, font: 'Consolas', size: 16 })]
-                }));
-            }
-
-            // Result
-            const result = validateScenario(s);
-            const resultColor = result === 'PASS' ? '008000' : (result === 'NOT PASS' ? 'FF0000' : '666666');
-            children.push(new Paragraph({
-                children: [
-                    new TextRun({ text: 'Result: ', bold: true, size: 20 }),
-                    new TextRun({ text: result, bold: true, size: 20, color: resultColor })
-                ]
-            }));
-
-            // Notes
-            if (s.notes) {
+            } else {
                 children.push(new Paragraph({
                     children: [
-                        new TextRun({ text: 'Notes: ', bold: true, size: 20 }),
-                        new TextRun({ text: s.notes, size: 20 })
+                        new TextRun({ text: 'Expected Result: ', bold: true, size: 20 }),
+                        new TextRun({ text: s.expected_result, size: 20 })
                     ]
                 }));
+
+                // Request (URL + Headers + Body Request), each line its own paragraph
+                children.push(new Paragraph({
+                    children: [new TextRun({ text: 'Request:', bold: true, size: 20 })]
+                }));
+                if (s.request) {
+                    monospaceParagraphs(s.request, 16, 720).forEach(p => children.push(p));
+                }
+
+                // Response
+                children.push(new Paragraph({
+                    children: [new TextRun({ text: 'Response:', bold: true, size: 20 })]
+                }));
+                if (s.response) {
+                    monospaceParagraphs(s.response, 16, 720).forEach(p => children.push(p));
+                }
+
+                const result = validateScenario(s);
+                const resultColor = result === 'PASS' ? '008000' : (result === 'NOT PASS' ? 'FF0000' : '666666');
+                children.push(new Paragraph({
+                    children: [
+                        new TextRun({ text: 'Result: ', bold: true, size: 20 }),
+                        new TextRun({ text: result, bold: true, size: 20, color: resultColor })
+                    ]
+                }));
+
+                if (s.hasil_aktual) {
+                    children.push(new Paragraph({
+                        children: [
+                            new TextRun({ text: 'Hasil Aktual: ', bold: true, size: 20 }),
+                            new TextRun({ text: s.hasil_aktual, size: 20 })
+                        ]
+                    }));
+                }
             }
-        }
-        children.push(new Paragraph({ text: '' }));
-        subIdx++;
-    });
+            children.push(new Paragraph({ text: '' }));
+        });
 
-    // Section 4: Pengecekan Mutasi
-    children.push(new Paragraph({ children: [new PageBreak()] }));
-    children.push(new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: '4 Pengecekan Mutasi Dan Jurnal', bold: true })]
-    }));
-    children.push(new Paragraph({
-        children: [new TextRun({ text: 'Hasil pengecekan mutasi dan jurnal akan dilampirkan terpisah.' })]
-    }));
+        // Summary
+        children.push(new Paragraph({ children: [new PageBreak()] }));
+        children.push(new Paragraph({
+            heading: HeadingLevel.HEADING_1,
+            children: [new TextRun({ text: 'Ringkasan Hasil Pengujian', bold: true })]
+        }));
 
-    // Summary section
-    children.push(new Paragraph({ children: [new PageBreak()] }));
-    children.push(new Paragraph({
-        heading: HeadingLevel.HEADING_1,
-        children: [new TextRun({ text: 'Ringkasan Hasil Pengujian', bold: true })]
-    }));
+        let passed = 0, failed = 0, naCount = 0, notTested = 0;
+        parsedScenarios.forEach(s => {
+            const r = validateScenario(s);
+            if (r === 'PASS') passed++;
+            else if (r === 'NOT PASS') failed++;
+            else if (r === 'N/A') naCount++;
+            else notTested++;
+        });
 
-    let passed = 0, failed = 0, naCount = 0, notTested = 0;
-    parsedScenarios.forEach(s => {
-        if (isScenarioSkipped(s)) { naCount++; return; }
-        const r = validateScenario(s);
-        if (r === 'PASS') passed++;
-        else if (r === 'NOT PASS') failed++;
-        else notTested++;
-    });
-
-    const summaryData = [
-        ['Kategori', 'Jumlah'],
-        ['Total Skenario', String(parsedScenarios.length)],
-        ['PASS', String(passed)],
-        ['NOT PASS', String(failed)],
-        ['Tidak Diuji (N/A)', String(naCount)],
-        ['Belum Diisi', String(notTested)]
-    ];
-
-    const summaryRows = summaryData.map((row, idx) => {
-        return new TableRow({
+        const summaryData = [
+            ['Kategori', 'Jumlah'],
+            ['Total Skenario', String(parsedScenarios.length)],
+            ['PASS', String(passed)],
+            ['NOT PASS', String(failed)],
+            ['Tidak Diuji (N/A)', String(naCount)],
+            ['Belum Diisi', String(notTested)]
+        ];
+        const summaryRows = summaryData.map((row, i) => new TableRow({
             children: row.map(cellText => new TableCell({
                 children: [new Paragraph({
                     children: [new TextRun({
-                        text: cellText,
-                        bold: idx === 0,
-                        size: 20,
-                        color: idx === 0 ? 'FFFFFF' : '000000'
+                        text: cellText, bold: i === 0, size: 20,
+                        color: i === 0 ? 'FFFFFF' : '000000'
                     })]
                 })],
-                shading: idx === 0 ? { type: ShadingType.SOLID, color: '4472C4' } : undefined,
+                shading: i === 0 ? { type: ShadingType.SOLID, color: '4472C4' } : undefined,
                 width: { size: 4000, type: WidthType.DXA }
             }))
-        });
-    });
-
-    children.push(new Table({ rows: summaryRows }));
-
-    // Create document
-    const doc = new Document({
-        sections: [{ children: children }]
-    });
-
-    const blob = await Packer.toBlob(doc);
-    const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    saveAs(blob, `UAT_Result_QRIS_Merchant_Aggregator_${timestamp}.docx`);
-    addLog('UAT Result berhasil di-generate!', 'success');
-}
-
-// =============================================================================
-// DOCX GENERATION - LAMPIRAN 7C
-// =============================================================================
-
-async function generateLampiran7C() {
-    addLog('Generating Lampiran 7C...', 'info');
-    updateMetadataFromUI();
-
-    const { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType,
-            Table, TableRow, TableCell, WidthType, BorderStyle,
-            ShadingType, PageOrientation } = docx;
-
-    const children = [];
-
-    // Header
-    children.push(new Paragraph({
-        alignment: AlignmentType.CENTER,
-        children: [new TextRun({ text: 'Lampiran 7.C', bold: true, size: 28 })]
-    }));
-    children.push(new Paragraph({
-        alignment: AlignmentType.CENTER,
-        children: [new TextRun({ text: 'Skenario dan Hasil Uji Fungsionalitas', bold: true, size: 24 })]
-    }));
-    children.push(new Paragraph({ text: '' }));
-
-    // Metadata
-    const metaItems = [
-        ['Nama Penyedia Layanan', metadata.nama_penyedia],
-        ['Nama Pengguna Layanan', metadata.nama_pengguna],
-        ['Nama Layanan API', metadata.nama_layanan],
-        ['Tanggal Pengujian', metadata.tanggal_pengujian]
-    ];
-    metaItems.forEach(([label, value]) => {
-        children.push(new Paragraph({
-            children: [
-                new TextRun({ text: `${label}: `, bold: true, size: 20 }),
-                new TextRun({ text: value || '', size: 20 })
-            ]
         }));
-    });
-    children.push(new Paragraph({ text: '' }));
+        children.push(new Table({ rows: summaryRows }));
 
-    // Scenario table
-    const headerTexts = ['No', 'Service', 'Scenario', 'Expected Result', 'Request', 'Response', 'Result', 'Notes'];
+        const doc = new Document({ sections: [{ children: children }] });
+        const blob = await Packer.toBlob(doc);
+        const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        saveAs(blob, `UAT_Result_QRIS_Merchant_Aggregator_${timestamp}.docx`);
+        addLog('UAT Result berhasil di-generate!', 'success');
+    };
 
-    const headerRow = new TableRow({
-        children: headerTexts.map(h => new TableCell({
-            children: [new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [new TextRun({ text: h, bold: true, size: 16, color: 'FFFFFF' })]
-            })],
-            shading: { type: ShadingType.SOLID, color: '4472C4' },
-            width: { size: h === 'No' ? 600 : (h === 'Result' ? 800 : 1500), type: WidthType.DXA }
-        }))
-    });
+    // =========================================================================
+    // DOCX GENERATION - LAMPIRAN 7C
+    // =========================================================================
+    async function generateLampiran7C() {
+        addLog('Generating Lampiran 7C...', 'info');
+        updateMetadataFromUI();
 
-    const dataRows = parsedScenarios.map(s => {
-        const isSkipped = isScenarioSkipped(s);
-        let resultText, notesText;
-        if (isSkipped) {
-            resultText = 'N/A';
-            notesText = s.notes || 'Tidak dites karena tidak sesuai dengan kondisi produk.';
-        } else {
-            resultText = validateScenario(s);
-            notesText = s.notes || '';
-        }
+        const { Document, Packer, Paragraph, TextRun, AlignmentType,
+                Table, TableRow, TableCell, WidthType, ShadingType, PageOrientation } = docx;
 
-        const resultColor = resultText === 'PASS' ? '008000' : (resultText === 'NOT PASS' ? 'FF0000' : '666666');
+        const children = [];
 
-        const cellData = [s.no, s.service, s.scenario, s.expected_result, s.request || '', s.response || '', resultText, notesText];
+        children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [new TextRun({ text: 'Lampiran 7.C', bold: true, size: 28 })]
+        }));
+        children.push(new Paragraph({
+            alignment: AlignmentType.CENTER,
+            children: [new TextRun({ text: 'Skenario dan Hasil Uji Fungsionalitas', bold: true, size: 24 })]
+        }));
+        children.push(new Paragraph({ text: '' }));
 
-        return new TableRow({
-            children: cellData.map((text, idx) => new TableCell({
+        const metaItems = [
+            ['Nama Penyedia Layanan', metadata.nama_penyedia],
+            ['Nama Pengguna Layanan', metadata.nama_pengguna],
+            ['Nama Layanan API', metadata.nama_layanan],
+            ['Tanggal Pengujian', metadata.tanggal_pengujian]
+        ];
+        metaItems.forEach(([label, value]) => {
+            children.push(new Paragraph({
+                children: [
+                    new TextRun({ text: `${label}: `, bold: true, size: 20 }),
+                    new TextRun({ text: value || '', size: 20 })
+                ]
+            }));
+        });
+        children.push(new Paragraph({ text: '' }));
+
+        const headerTexts = ['No', 'Service', 'Scenario', 'Expected Result', 'Request', 'Response', 'Result', 'Notes'];
+        const headerRow = new TableRow({
+            children: headerTexts.map(h => new TableCell({
                 children: [new Paragraph({
-                    alignment: idx === 6 ? AlignmentType.CENTER : AlignmentType.LEFT,
-                    children: [new TextRun({
-                        text: text || '',
-                        size: 14,
-                        bold: idx === 6,
-                        color: idx === 6 ? resultColor : '000000',
-                        font: (idx === 4 || idx === 5) ? 'Consolas' : 'Calibri'
-                    })]
+                    alignment: AlignmentType.CENTER,
+                    children: [new TextRun({ text: h, bold: true, size: 16, color: 'FFFFFF' })]
                 })],
-                width: { size: idx === 0 ? 600 : (idx === 6 ? 800 : 1500), type: WidthType.DXA }
+                shading: { type: ShadingType.SOLID, color: '4472C4' },
+                width: { size: h === 'No' ? 600 : (h === 'Result' ? 800 : 1500), type: WidthType.DXA }
             }))
         });
-    });
 
-    children.push(new Table({
-        rows: [headerRow, ...dataRows],
-        width: { size: 100, type: WidthType.PERCENTAGE }
-    }));
+        const dataRows = parsedScenarios.map((s, idx) => {
+            let resultText, notesText;
+            if (s.is_skipped) {
+                resultText = 'N/A';
+                notesText = s.hasil_aktual || 'Tidak dites karena tidak sesuai dengan kondisi produk.';
+            } else {
+                resultText = validateScenario(s);
+                notesText = s.hasil_aktual || '';
+            }
+            const resultColor = resultText === 'PASS' ? '008000' : (resultText === 'NOT PASS' ? 'FF0000' : '666666');
 
-    // Footer notes
-    children.push(new Paragraph({ text: '' }));
-    const footerNotes = [
-        'Lampiran Skenario hasil uji fungsional sekurangnya 1 Pengguna Layanan atas 1 sub API unverified, dengan ketentuan sebagai berikut:',
-        '',
-        'a. Pada kolom request diisi dengan request yang dilakukan Pengguna layanan, sedangkan pada kolom response diisi dengan respon yang diberikan Penyedia. Sementara pada kolom result diisi dengan hasil PASS atau NOT PASS yang harus sesuai dengan expected result.',
-        '',
-        'b. Pengisian pada dokumen skenario hasil uji fungsional tidak dilakukan dengan cara screen capture, melainkan dilakukan dengan cara copy paste payload request dan response dari log API server ke kolom tabel skenario hasil uji fungsional.',
-        '',
-        'c. Seluruh skenario diujikan dan tidak boleh dihapus atau diubah. Dalam hal terdapat skenario yang tidak diujikan dapat dikosongkan pengisiannya, namun diberikan catatan pada kolom Notes yang akan kami review lebih lanjut apakah skenario diperkenankan untuk tidak diujikan.',
-        '',
-        'd. Dalam hal terdapat penambahan skenario pengujian, maka penambahan tersebut dilakukan pada baris paling bawah, sehingga tidak mengubah susunan atau urutan template skenario.'
-    ];
-    footerNotes.forEach(note => {
-        children.push(new Paragraph({
-            indent: { left: 720 },
-            children: [new TextRun({ text: note, size: 16, italics: true })]
+            const noLabel = s.aspi_no || s.nomor_kasus_tes || String(idx + 1);
+            const name = s.scenario_name || s.langkah_tes || '';
+
+            return new TableRow({
+                children: [
+                    multiLineCell(noLabel, { width: 600 }),
+                    multiLineCell(s.nama_modul, { width: 1500 }),
+                    multiLineCell(name, { width: 1500 }),
+                    multiLineCell(s.expected_result, { width: 1500 }),
+                    multiLineCell(s.request || '', { width: 1500, font: 'Consolas' }),
+                    multiLineCell(s.response || '', { width: 1500, font: 'Consolas' }),
+                    multiLineCell(resultText, { width: 800, bold: true, color: resultColor, alignment: AlignmentType.CENTER }),
+                    multiLineCell(notesText, { width: 1500 })
+                ]
+            });
+        });
+
+        children.push(new Table({
+            rows: [headerRow, ...dataRows],
+            width: { size: 100, type: WidthType.PERCENTAGE }
         }));
-    });
 
-    // Create document (landscape)
-    const doc = new Document({
-        sections: [{
-            properties: {
-                page: {
-                    size: { orientation: PageOrientation.LANDSCAPE }
-                }
-            },
-            children: children
-        }]
-    });
+        children.push(new Paragraph({ text: '' }));
+        const footerNotes = [
+            'Lampiran Skenario hasil uji fungsional sekurangnya 1 Pengguna Layanan atas 1 sub API unverified, dengan ketentuan sebagai berikut:',
+            '',
+            'a. Pada kolom request diisi dengan request yang dilakukan Pengguna layanan, sedangkan pada kolom response diisi dengan respon yang diberikan Penyedia. Sementara pada kolom result diisi dengan hasil PASS atau NOT PASS yang harus sesuai dengan expected result.',
+            '',
+            'b. Pengisian pada dokumen skenario hasil uji fungsional tidak dilakukan dengan cara screen capture, melainkan dilakukan dengan cara copy paste payload request dan response dari log API server ke kolom tabel skenario hasil uji fungsional.',
+            '',
+            'c. Seluruh skenario diujikan dan tidak boleh dihapus atau diubah. Dalam hal terdapat skenario yang tidak diujikan dapat dikosongkan pengisiannya, namun diberikan catatan pada kolom Notes yang akan kami review lebih lanjut apakah skenario diperkenankan untuk tidak diujikan.',
+            'd. Dalam hal terdapat penambahan skenario pengujian, maka penambahan tersebut dilakukan pada baris paling bawah, sehingga tidak mengubah susunan atau urutan template skenario.'
+        ];
+        footerNotes.forEach(note => {
+            children.push(new Paragraph({
+                indent: { left: 720 },
+                children: [new TextRun({ text: note, size: 16, italics: true })]
+            }));
+        });
 
-    const blob = await Packer.toBlob(doc);
-    const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    saveAs(blob, `Lampiran_7C_QRIS_${timestamp}.docx`);
-    addLog('Lampiran 7C berhasil di-generate!', 'success');
+        const doc = new Document({
+            sections: [{
+                properties: { page: { size: { orientation: PageOrientation.LANDSCAPE } } },
+                children: children
+            }]
+        });
+
+        const blob = await Packer.toBlob(doc);
+        const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        saveAs(blob, `Lampiran_7C_QRIS_${timestamp}.docx`);
+        addLog('Lampiran 7C berhasil di-generate!', 'success');
+    };
+
+    // ---- Utilities ---------------------------------------------------------
+    async function generateBoth() {
+        await generateUATResult();
+        await generateLampiran7C();
+        addLog('Kedua dokumen berhasil di-generate!', 'success');
+    };
+
+    function updateMetadataFromUI() {
+        metadata.nama_penyedia = document.getElementById('namaPenyedia').value || metadata.nama_penyedia;
+        metadata.nama_pengguna = document.getElementById('namaPengguna').value || metadata.nama_pengguna;
+        metadata.nama_layanan = document.getElementById('namaLayanan').value || metadata.nama_layanan;
+        metadata.tanggal_pengujian = document.getElementById('tanggalPengujian').value || metadata.tanggal_pengujian;
+
+        const skippedInput = document.getElementById('skippedScenarios').value;
+        if (skippedInput.trim()) {
+            const additional = skippedInput.split(',').map(s => s.trim()).filter(Boolean);
+            additional.forEach(no => {
+                skippedSet.add(no);
+                // Reflect the manual skip onto matching scenarios so validation follows
+                parsedScenarios.forEach(s => {
+                    if ((s.nomor_kasus_tes === no) || (s.aspi_no === no)) s.is_skipped = true;
+                });
+            });
+        }
+    };
+
+    function addLog(message, type) {
+        const logArea = document.getElementById('logArea');
+        logArea.style.display = 'block';
+        const timestamp = new Date().toLocaleTimeString('id-ID');
+        const className = type === 'success' ? 'log-success' : (type === 'error' ? 'log-error' : 'log-info');
+        logArea.innerHTML += `<div class="${className}">[${timestamp}] ${message}</div>`;
+        logArea.scrollTop = logArea.scrollHeight;
+    };
+
+    // ---- Expose functions on window ----------------------------------------
+    // The generate buttons in index.html use inline onclick="generateUATResult()"
+    // etc., which resolve against the global (window) scope, so expose them.
+    window.handleFile = handleFile;
+    window.processFile = processFile;
+    window.resetFile = resetFile;
+    window.parseExcel = parseExcel;
+    window.validateAndShowResults = validateAndShowResults;
+    window.generateUATResult = generateUATResult;
+    window.generateLampiran7C = generateLampiran7C;
+    window.generateBoth = generateBoth;
+    window.updateMetadataFromUI = updateMetadataFromUI;
+    window.addLog = addLog;
+
+    // ---- Wire the index-page buttons (Proses File / Hapus File) ------------
+    const btnProses = document.getElementById('btnProses');
+    const btnHapus = document.getElementById('btnHapus');
+    if (btnProses) btnProses.addEventListener('click', processFile);
+    if (btnHapus) btnHapus.addEventListener('click', resetFile);
 }
 
 // =============================================================================
-// UTILITIES
+// HEADLESS EXPORT (guarded) - lets bun/node import the pure parsing functions
+// without touching the DOM. Browsers load this file via <script>, where
+// module is undefined, so this block is skipped.
 // =============================================================================
-
-async function generateBoth() {
-    await generateUATResult();
-    await generateLampiran7C();
-    addLog('Kedua dokumen berhasil di-generate!', 'success');
-}
-
-function updateMetadataFromUI() {
-    metadata.nama_penyedia = document.getElementById('namaPenyedia').value || metadata.nama_penyedia;
-    metadata.nama_pengguna = document.getElementById('namaPengguna').value || metadata.nama_pengguna;
-    metadata.nama_layanan = document.getElementById('namaLayanan').value || metadata.nama_layanan;
-    metadata.tanggal_pengujian = document.getElementById('tanggalPengujian').value || metadata.tanggal_pengujian;
-
-    // Update skipped scenarios from textarea
-    const skippedInput = document.getElementById('skippedScenarios').value;
-    if (skippedInput.trim()) {
-        const additional = skippedInput.split(',').map(s => s.trim()).filter(s => s);
-        additional.forEach(s => skippedSet.add(s));
-    }
-}
-
-function addLog(message, type) {
-    const logArea = document.getElementById('logArea');
-    logArea.style.display = 'block';
-    const timestamp = new Date().toLocaleTimeString('id-ID');
-    const className = type === 'success' ? 'log-success' : (type === 'error' ? 'log-error' : 'log-info');
-    logArea.innerHTML += `<div class="${className}">[${timestamp}] ${message}</div>`;
-    logArea.scrollTop = logArea.scrollHeight;
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        RemarksParser,
+        ResponseParser,
+        cleanScenarioName,
+        extractAspiNumber,
+        extractExpectedCode,
+        extractResponseCode,
+        validateScenario,
+        findHeaderRow,
+        pickWorksheet,
+        parseWorkbookData,
+        SKIP_STATUSES
+    };
 }
