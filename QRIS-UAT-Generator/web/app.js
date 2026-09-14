@@ -961,9 +961,10 @@ if (IS_BROWSER) {
 
         // Proportional column widths (twips) for the 8 columns
         // [No, Service, Scenario, Expected Result, Request, Response, Result, Notes].
-        // Request/Response are the widest; No/Result are narrow. The total is sized
-        // to fit an A3 landscape text area (page 16838 twips wide, 720 twip margins
-        // => ~15398 usable) so the fixed tblGrid is honored by Word without collapse.
+        // Request/Response are the widest; No/Result are narrow. The total (15340)
+        // fits comfortably inside the A3 landscape text area emitted below
+        // (page 23811 twips wide, 680 twip side margins => 22451 usable, ~7111 twips
+        // of slack) so the fixed tblGrid is honored by Word without collapse.
         const COL_WIDTHS = [520, 1350, 2150, 2000, 3350, 3350, 720, 1900];
         const TABLE_WIDTH = COL_WIDTHS.reduce((a, b) => a + b, 0); // 15340 twips
 
@@ -1065,13 +1066,18 @@ if (IS_BROWSER) {
             sections: [{
                 properties: {
                     page: {
-                        // A3 landscape (16838 x 23811 twips) gives room for the wide
-                        // Request/Response columns; margins chosen so the 8-column
-                        // table (TABLE_WIDTH twips) fits inside the text area.
+                        // A3 landscape. NOTE: under PageOrientation.LANDSCAPE docx.js
+                        // swaps the pair so the LARGER value becomes the emitted page
+                        // width (w:w) and the smaller becomes the height (w:h). To get
+                        // the wide A3 long side (23811) as the actual page width we must
+                        // pass width=16838 / height=23811 here; docx.js then emits
+                        // <w:pgSz w:w="23811" w:h="16838" w:orient="landscape"/>.
+                        // Usable width = 23811 - (680 + 680) = 22451 twips, so the
+                        // 15340-twip table has ~7111 twips (~12.5 cm) of headroom.
                         size: {
                             orientation: PageOrientation.LANDSCAPE,
-                            width: 23811,
-                            height: 16838
+                            width: 16838,
+                            height: 23811
                         },
                         margin: { top: 720, right: 680, bottom: 720, left: 680 }
                     }
