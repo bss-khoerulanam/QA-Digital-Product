@@ -1,5 +1,5 @@
 /**
- * QRIS UAT Document Generator - Web Version
+ * QRIS Document Generator - Web Version
  * Bank Sahabat Sampoerna (BSS)
  *
  * Generates UAT Result and Lampiran 7C documents from UAT Script Excel.
