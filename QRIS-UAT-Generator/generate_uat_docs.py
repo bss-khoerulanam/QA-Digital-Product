@@ -42,6 +42,28 @@ SKIP_REASON = "Tidak dites karena tidak sesuai dengan kondisi produk."
 SKIP_STATUSES = ["tidak dites", "tidak ditest"]
 
 
+def clean_scenario_name(langkah_tes):
+    """Clean a scenario name from the 'Langkah Tes' cell.
+
+    Shared by both generators so they clean identically:
+      - strip the leading ASPI number prefix (e.g. "18,1 " / "3.5 "),
+      - drop trailing comment/marker artifacts that some cells carry after a
+        newline (e.g. "======" separators or long descriptive continuations),
+      - collapse to the first meaningful line.
+
+    Legitimate short multi-line names are preserved; only trailing artifact
+    blocks (separator markers) are removed.
+    """
+    if not langkah_tes:
+        return ""
+    cleaned = str(langkah_tes)
+    # Remove leading number pattern like "18,1 " or "3,5 "
+    cleaned = re.sub(r'^\d+[,.]\d+\s*', '', cleaned)
+    # Remove marker/comment artifacts (a line of ===== and everything after it)
+    cleaned = re.sub(r'\n.*?======.*', '', cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+
+
 
 # =============================================================================
 # REMARKS PARSER - Memisahkan URL, Headers, Request Body, Response
@@ -255,10 +277,11 @@ class RemarksParser:
 
         else:
             # No HTTP method line found - might be notification format
-            # (starts directly with headers like Authorization:, Content-Type:, etc.)
+            # (e.g. Kirimo Payment Notify row: starts with "URL: https://..."
+            #  followed by headers like Authorization:, Content-Type:, then JSON body)
             header_lines = []
             body_start = -1
-            
+
             for i in range(start_idx, len(lines)):
                 line = lines[i].strip()
                 if line.startswith('{'):
@@ -267,6 +290,11 @@ class RemarksParser:
                 elif line == '':
                     # Empty line might mean body follows
                     continue
+                # Capture a leading "URL: <full url>" line as the request URL
+                # (notification format has no "POST /path HTTP/1.1" method line).
+                elif re.match(r'^url\s*:\s*\S', line, re.IGNORECASE):
+                    url_value = line.split(':', 1)[1].strip()
+                    url = f"URL:\n{url_value}"
                 elif re.match(r'^[\w-]+[\w-]*\s*:', line):
                     header_lines.append(line)
 
@@ -356,13 +384,25 @@ class ResponseParser:
 
     @staticmethod
     def extract_response_code(response_text):
-        """Extract responseCode from response text."""
+        """Extract responseCode from response text.
+
+        The Kirimo Response section looks like:
+            HTTP/1.1 <code>
+            <headers>
+
+            {... "responseCode":"2004700" ...}
+        so the responseCode lives inside the JSON body that appears AFTER the
+        HTTP status line and headers. We search the whole text for the
+        responseCode field. If it is absent we DO NOT fall back to the
+        HTTP status line (e.g. 'HTTP/1.1 200') - that is not a 7-digit
+        responseCode and inventing one would produce wrong PASS/NOT PASS.
+        """
         if not response_text:
             return None
         patterns = [
             r'"responseCode"\s*:\s*"(\d+)"',
             r'"responseCode"\s*:\s*(\d+)',
-            r'responseCode.*?(\d{7})',
+            r'responseCode["\s:]*(\d{7})',
         ]
         for pattern in patterns:
             match = re.search(pattern, response_text)
@@ -634,6 +674,15 @@ class UATScriptParser:
                 print(f"      -> Kolom terdeteksi: {list(col_map.keys())}")
                 return row_idx, col_map
 
+        # Secondary detection: English-style layout used by the older sample
+        # (QRIS-UAT-Generator/UAT_Script_QRIS.xlsx). Columns are:
+        #   No | Service | Scenario | Expected Result | Request | Response | Result | Notes
+        # This only runs if the Indonesian layout above was not found, so it
+        # never affects detection of the Kirimo file (Indonesian header row 21).
+        english_map = self._find_english_header_row(ws)
+        if english_map is not None:
+            return english_map
+
         # Fallback - try simpler detection (look for "Langkah Tes" anywhere)
         for row_idx in range(1, min(50, ws.max_row + 1)):
             for col_idx in range(1, ws.max_column + 1):
@@ -663,6 +712,63 @@ class UATScriptParser:
                     return row_idx, col_map
 
         return None, {}
+
+    def _find_english_header_row(self, ws):
+        """Detect the old sample's English header layout and build a col_map.
+
+        Maps the English columns onto the internal scenario keys so response
+        parsing still works:
+            Service         -> nama_modul
+            Scenario        -> langkah_tes
+            Expected Result -> hasil_diharapkan
+            Request         -> (kept, not mapped to a required key)
+            Response        -> remarks   (so RemarksParser sees the payload)
+            Result          -> hasil_aktual
+            Notes           -> remarks   (only if no Response column)
+
+        Returns (row_idx, col_map) or None if no English header is found.
+        """
+        for row_idx in range(1, min(50, ws.max_row + 1)):
+            first_lines = []
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                v = str(cell.value or '').strip().lower()
+                first_lines.append(v.split('\n')[0].strip() if v else '')
+
+            has_scenario = any(fl == 'scenario' for fl in first_lines)
+            has_expected = any('expected' in fl and 'result' in fl for fl in first_lines)
+            has_service = any(fl == 'service' for fl in first_lines)
+
+            # Require the distinctive English headers so we don't misfire.
+            if not (has_scenario and has_expected and has_service):
+                continue
+
+            col_map = {}
+            for idx, fl in enumerate(first_lines):
+                if fl == 'service':
+                    col_map['nama_modul'] = idx
+                elif fl == 'scenario':
+                    col_map['langkah_tes'] = idx
+                elif 'expected' in fl and 'result' in fl:
+                    col_map['hasil_diharapkan'] = idx
+                elif fl == 'response':
+                    col_map['remarks'] = idx
+                elif fl == 'result':
+                    col_map['hasil_aktual'] = idx
+                elif fl == 'notes':
+                    col_map['notes'] = idx
+                elif fl == 'no':
+                    col_map['nomor_kasus_tes'] = idx
+
+            # If there is no explicit Response column, use Notes as remarks.
+            if 'remarks' not in col_map and 'notes' in col_map:
+                col_map['remarks'] = col_map['notes']
+
+            print(f"      -> Header row (English layout) ditemukan di baris {row_idx}")
+            print(f"      -> Kolom terdeteksi: {list(col_map.keys())}")
+            return row_idx, col_map
+
+        return None
 
     def _extract_aspi_number(self, langkah_tes):
         """Extract ASPI scenario number from Langkah Tes field."""
@@ -707,32 +813,66 @@ class ResultValidator:
         Validate if response matches expected result.
         Kriteria: responseCode di response HARUS sama dengan expected result.
         Returns: 'PASS', 'NOT PASS', 'N/A', atau 'NOT TESTED'
+
+        Status rules (ASPI, per user):
+          - PASS      : actual responseCode matches the expected response/error
+                        code from the UAT table (including 'xx' wildcard).
+          - NOT PASS  : actual responseCode present but does not match expected.
+          - N/A       : scenario is 'Tidak dites'/'Tidak ditest' (skipped), OR a
+                        functional 'Berhasil' scenario whose expected result has
+                        no extractable response/error code and carries no Remarks
+                        payload (functional pass, not an API-code test).
+          - NOT TESTED: scenario expected an API code and had response data but
+                        the code could not be extracted, or had no response at
+                        all while not skipped.
         """
-        # If skipped
+        # If skipped ('Tidak dites' / yellow-highlighted rows not applicable)
         if scenario.get("is_skipped"):
             return "N/A"
 
-        # If no response data
-        if not scenario.get("response") or scenario["response"].strip() == "":
-            # Check if hasil_aktual says "Berhasil"
-            if scenario.get("hasil_aktual", "").lower() == "berhasil":
-                return "NOT TESTED"  # Has result but no evidence
-            return "NOT TESTED"
-
-        # Extract codes
         expected_code = ResultValidator.extract_expected_code(scenario.get("expected_result", ""))
         actual_code = ResponseParser.extract_response_code(scenario.get("response", ""))
+        has_response = bool(scenario.get("response") and scenario["response"].strip())
+        has_remarks_payload = bool(
+            (scenario.get("request") and scenario["request"].strip())
+            or has_response
+        )
+        is_berhasil = scenario.get("hasil_aktual", "").lower() == "berhasil"
 
-        if not expected_code or not actual_code:
-            # Can't validate - check hasil_aktual
-            if scenario.get("hasil_aktual", "").lower() == "berhasil":
-                return "PASS"
+        # No response payload at all.
+        if not has_response:
+            # Functional 'Berhasil' scenario with no expected API code and no
+            # Remarks payload -> N/A (functional pass, e.g. Kirimo kasus 4.1/4.2/
+            # 5.x whose expected result is descriptive text with no code).
+            if is_berhasil and expected_code is None and not has_remarks_payload:
+                return "N/A"
+            # Notification-format 'Berhasil' scenario: the partner supplied a
+            # request/notification payload (URL + headers + body) but there is
+            # no Response section to validate a responseCode against (e.g.
+            # Kirimo qr-mpm-notify / Payment Notify). Treat as N/A per ASPI
+            # rules - there is no responseCode to compare, and the partner
+            # declared the functional flow successful.
+            if is_berhasil and has_remarks_payload:
+                return "N/A"
+            # Otherwise a code/response was expected but none captured, or the
+            # row is not a declared functional pass -> genuinely not tested.
             return "NOT TESTED"
 
-        # Handle xx pattern (e.g., 401xx01)
+        # Response payload present.
+        if not expected_code or not actual_code:
+            # Expected result carries no code to validate against but the
+            # scenario succeeded functionally -> treat as functional pass.
+            if expected_code is None and is_berhasil:
+                return "N/A"
+            # Expected an API code and had response data but the responseCode
+            # could not be extracted -> not properly tested.
+            return "NOT TESTED"
+
+        # Handle xx pattern (e.g., 401xx01 must match exactly 7 digits like
+        # 4014701). Anchor fully so it does not match longer/shorter strings.
         if "xx" in expected_code:
-            pattern = expected_code.replace("xx", r"\d{2}")
-            if re.match(pattern, actual_code):
+            pattern = "^" + re.escape(expected_code).replace("xx", r"\d{2}") + "$"
+            if re.fullmatch(pattern, actual_code):
                 return "PASS"
             else:
                 return "NOT PASS"
@@ -995,13 +1135,7 @@ class Lampiran7CGenerator:
 
     def _extract_scenario_name(self, langkah_tes):
         """Extract scenario name from Langkah Tes, removing ASPI number prefix."""
-        if not langkah_tes:
-            return ""
-        # Remove leading number pattern like "18,1 " or "3,5 "
-        cleaned = re.sub(r'^\d+[,.]\d+\s*', '', langkah_tes)
-        # Remove comment artifacts
-        cleaned = re.sub(r'\n.*?======.*', '', cleaned, flags=re.DOTALL)
-        return cleaned.strip()
+        return clean_scenario_name(langkah_tes)
 
     def _add_footer_notes(self):
         """Add footer notes as per ASPI requirements."""
@@ -1136,9 +1270,8 @@ class UATResultGenerator:
                              "qr" in s.get("nama_modul", "").lower()]
 
         for idx, scenario in enumerate(qr_scenarios, 1):
-            scenario_name = re.sub(r'^\d+[,.]\d+\s*', '', scenario.get("langkah_tes", ""))
-            scenario_name = re.sub(r'\n.*?======.*', '', scenario_name, flags=re.DOTALL).strip()
-            
+            scenario_name = clean_scenario_name(scenario.get("langkah_tes", ""))
+
             aspi_no = scenario.get("aspi_no", "")
             self.doc.add_heading(f"3.{idx} {aspi_no} {scenario_name}", level=2)
 
@@ -1160,26 +1293,15 @@ class UATResultGenerator:
         # Request (URL + Headers + Body)
         p = self.doc.add_paragraph()
         p.add_run("Request:").bold = True
-        
-        request_text = scenario.get("request", "")
-        if request_text:
-            p = self.doc.add_paragraph()
-            p.paragraph_format.left_indent = Cm(0.5)
-            run = p.add_run(request_text)
-            run.font.name = 'Consolas'
-            run.font.size = Pt(8)
+        # Render each line as its own paragraph so URL, Headers, and Body
+        # Request each appear on their own line (python-docx does NOT render
+        # embedded \n inside a single run).
+        self._add_monospace_block(scenario.get("request", ""))
 
         # Response
         p = self.doc.add_paragraph()
         p.add_run("Response:").bold = True
-        
-        response_text = scenario.get("response", "")
-        if response_text:
-            p = self.doc.add_paragraph()
-            p.paragraph_format.left_indent = Cm(0.5)
-            run = p.add_run(response_text)
-            run.font.name = 'Consolas'
-            run.font.size = Pt(8)
+        self._add_monospace_block(scenario.get("response", ""))
 
         # Result
         result = self.validator.validate(scenario)
@@ -1191,6 +1313,24 @@ class UATResultGenerator:
             result_run.font.color.rgb = RGBColor(0, 128, 0)
         elif result == "NOT PASS":
             result_run.font.color.rgb = RGBColor(255, 0, 0)
+
+    def _add_monospace_block(self, text):
+        """Render a multi-line text block with each line on its own paragraph.
+
+        python-docx does NOT convert '\\n' inside a single run into a line
+        break, so we split on newlines and emit one indented Consolas Pt(8)
+        paragraph per line (mirrors add_cell_text used for table cells).
+        """
+        if not text:
+            return
+        for line in str(text).split('\n'):
+            p = self.doc.add_paragraph()
+            p.paragraph_format.left_indent = Cm(0.5)
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            run = p.add_run(line)
+            run.font.name = 'Consolas'
+            run.font.size = Pt(8)
 
     def _add_additional_sections(self):
         """Add remaining sections (Pengecekan Mutasi, etc.)."""
