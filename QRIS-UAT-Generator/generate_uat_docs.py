@@ -198,74 +198,60 @@ class RemarksParser:
             else:
                 url = f"URL:\n{url_line}"
 
-            # Find where headers end and body begins
-            # Headers are after HTTP line, body starts after empty line or "Request Body:" label
+            # Collect ALL lines after HTTP method line as headers until we hit
+            # an empty line or a JSON body (starts with {)
             header_lines = []
             body_start_idx = -1
             
-            # Check for explicit "Headers:" label
-            headers_label_idx = -1
-            request_body_label_idx = -1
-            
             for i in range(http_method_idx + 1, len(lines)):
                 line = lines[i].strip()
-                if re.match(r'^Headers?\s*:\s*$', line, re.IGNORECASE):
-                    headers_label_idx = i
-                elif re.match(r'^Request\s*Body\s*:\s*$', line, re.IGNORECASE):
-                    request_body_label_idx = i
+                
+                # Skip Host line (already included in URL)
+                if line.lower().startswith('host:'):
+                    continue
+                
+                # Skip HTTP version info (e.g., "User-Agent: Go-http-client/1.1")
+                # These are still headers, include them
+                
+                # Empty line = separator between headers and body
+                if line == '':
+                    body_start_idx = i + 1
                     break
-
-            if headers_label_idx >= 0 and request_body_label_idx >= 0:
-                # Explicit labels found
-                header_lines = lines[headers_label_idx + 1:request_body_label_idx]
-                body_lines = lines[request_body_label_idx + 1:]
-                body = '\n'.join(body_lines).strip()
-            else:
-                # No explicit labels - parse by content
-                # Headers are key: value pairs after Host line
-                # Body is JSON content (starts with {)
-                in_headers = True
-                for i in range(http_method_idx + 1, len(lines)):
-                    line = lines[i].strip()
-                    
-                    # Skip Host line (already captured in URL)
-                    if line.lower().startswith('host:'):
-                        continue
-                    
-                    # Skip labels
-                    if re.match(r'^(Headers?|Request\s*Body)\s*:\s*$', line, re.IGNORECASE):
-                        if 'body' in line.lower():
-                            in_headers = False
-                        continue
-                    
-                    if in_headers:
-                        # Check if this line looks like a header (Key: Value)
-                        if re.match(r'^[\w-]+\s*:', line) and not line.startswith('{'):
-                            header_lines.append(lines[i])
-                        elif line.startswith('{') or line == '':
-                            in_headers = False
-                            if line.startswith('{'):
-                                body = '\n'.join(l for l in lines[i:]).strip()
-                                # But body might include response - trim at response
-                                break
-                    
-            headers = '\n'.join(l.strip() for l in header_lines if l.strip()).strip()
+                
+                # JSON body starts
+                if line.startswith('{'):
+                    body_start_idx = i
+                    break
+                
+                # Otherwise it's a header line (Key: Value or Key-Name: Value)
+                if re.match(r'^[\w-]+[\w-]*\s*:', line):
+                    header_lines.append(line)
             
-            # Clean body - remove trailing non-JSON content
-            if body:
-                # Find the end of JSON in body
-                brace_count = 0
-                json_end = -1
-                for i, ch in enumerate(body):
-                    if ch == '{':
-                        brace_count += 1
-                    elif ch == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            json_end = i + 1
-                            break
-                if json_end > 0:
-                    body = body[:json_end]
+            # Extract body (everything from body_start_idx to end)
+            if body_start_idx >= 0 and body_start_idx < len(lines):
+                body_text = '\n'.join(lines[body_start_idx:]).strip()
+                # Find the JSON object in body
+                if body_text:
+                    json_start = body_text.find('{')
+                    if json_start >= 0:
+                        body_text = body_text[json_start:]
+                        # Find end of JSON
+                        brace_count = 0
+                        json_end = -1
+                        for i, ch in enumerate(body_text):
+                            if ch == '{':
+                                brace_count += 1
+                            elif ch == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    json_end = i + 1
+                                    break
+                        if json_end > 0:
+                            body = body_text[:json_end]
+                        else:
+                            body = body_text
+            
+            headers = '\n'.join(header_lines).strip()
 
         else:
             # No HTTP method line found - might be notification format
@@ -278,7 +264,10 @@ class RemarksParser:
                 if line.startswith('{'):
                     body_start = i
                     break
-                elif re.match(r'^[\w-]+\s*:', line):
+                elif line == '':
+                    # Empty line might mean body follows
+                    continue
+                elif re.match(r'^[\w-]+[\w-]*\s*:', line):
                     header_lines.append(line)
 
             headers = '\n'.join(header_lines).strip()
@@ -793,18 +782,37 @@ def create_table_with_borders(doc, rows, cols):
 
 def add_cell_text(cell, text, font_name='Calibri', font_size=Pt(8),
                   bold=False, color=None, alignment=None):
-    """Add formatted text to a table cell."""
+    """Add formatted text to a table cell, properly handling newlines."""
     cell.text = ""
-    p = cell.paragraphs[0]
-    if alignment:
-        p.alignment = alignment
-    run = p.add_run(str(text) if text else "")
-    run.font.name = font_name
-    run.font.size = font_size
-    run.bold = bold
-    if color:
-        run.font.color.rgb = color
-    return run
+    
+    if not text:
+        return None
+    
+    text_str = str(text)
+    lines = text_str.split('\n')
+    
+    # Use the first paragraph already in the cell
+    for line_idx, line in enumerate(lines):
+        if line_idx == 0:
+            p = cell.paragraphs[0]
+        else:
+            p = cell.add_paragraph()
+        
+        if alignment:
+            p.alignment = alignment
+        
+        # Set small spacing between paragraphs for compact display
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        
+        run = p.add_run(line)
+        run.font.name = font_name
+        run.font.size = font_size
+        run.bold = bold
+        if color:
+            run.font.color.rgb = color
+    
+    return None
 
 
 
