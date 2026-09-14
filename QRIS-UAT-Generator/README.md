@@ -1,4 +1,4 @@
-# QRIS UAT Document Generator
+# QRIS Document Generator
 
 **Bank Sahabat Sampoerna - IT Quality Assurance**
 
@@ -42,6 +42,19 @@ Tool otomatis untuk generate dokumen UAT Result dan Lampiran 7C (Berita Acara) d
    - File UAT Script Excel (.xlsx)
 2. Double-click `run_generator.bat`
 3. Output dokumen muncul di folder `output/`
+
+#### Opsi lanjutan (CLI):
+
+```
+python generate_uat_docs.py <uat_script.xlsx> [--template <uat_result.docx>]
+```
+
+- Tanpa `--template`: perilaku default, generate **UAT Result** dan **Lampiran 7C** dari nol (seperti sebelumnya).
+- Dengan `--template`: jadikan **template UAT Result .docx** milik Anda (yang sudah berisi **screenshot** tiap skenario) sebagai dasar, lalu sisipkan hasil UAT Script (Expected Result, Request, Response) **tepat di bawah screenshot** tiap skenario. Output ditulis ke `output/UAT_Result_from_template_<tanggal>.docx`, dan **Lampiran 7C** tetap dihasilkan dari nol.
+
+> **Catatan:** Fitur `--template` (upload + merge template UAT Result ber-screenshot) **hanya tersedia di versi Python**. Versi Web hanya bisa membuat dokumen baru dan tidak bisa mengedit `.docx` existing yang berisi gambar.
+>
+> **Asumsi struktur template:** tiap skenario diawali sebuah **heading bernomor ASPI** (mis. `18.1 ...`, `18.2 ...`), dan screenshot skenario berada di antara heading itu dan heading skenario berikutnya. Konten disisipkan tepat sebelum heading skenario berikutnya (atau di akhir dokumen untuk skenario terakhir). Skenario data yang tidak punya heading pasangan di template akan dilewati dengan aman (muncul peringatan, proses tidak gagal).
 
 ---
 

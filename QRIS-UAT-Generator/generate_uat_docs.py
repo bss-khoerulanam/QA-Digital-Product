@@ -20,6 +20,7 @@ Author: IT QA BSS
 import re
 import sys
 import os
+import argparse
 from datetime import datetime
 
 from openpyxl import load_workbook
@@ -1438,33 +1439,238 @@ class UATResultGenerator:
 
 
 # =============================================================================
+# TEMPLATE MERGER (sisip hasil UAT Script ke template UAT Result ber-screenshot)
+# =============================================================================
+
+class TemplateMerger:
+    """Sisipkan hasil UAT Script ke dalam template UAT Result milik user.
+
+    Alur (opsi (a) yang disepakati user): template UAT Result .docx milik user
+    -- yang SUDAH berisi screenshot/gambar tiap skenario yang dimasukkan manual --
+    dijadikan DASAR dokumen. Untuk setiap skenario, konten hasil UAT Script
+    (Expected Result, Request [URL + Headers + Body], Response) disisipkan TEPAT
+    DI BAWAH screenshot skenario tersebut, tanpa menghapus/merusak screenshot.
+
+    ASUMSI STRUKTUR TEMPLATE (didokumentasikan; template asli belum tersedia):
+      - Tiap skenario dipisahkan oleh sebuah paragraf HEADING yang diawali nomor
+        ASPI, mis. "18.1 ...", "18.2 ...", "18,18 ..." (pemisah titik atau koma).
+      - Screenshot / gambar skenario berada di antara heading skenario itu dan
+        heading skenario BERIKUTNYA.
+      - Titik sisip = SETELAH blok skenario (setelah screenshot), yaitu TEPAT
+        SEBELUM heading skenario berikutnya; untuk skenario terakhir disisipkan
+        di AKHIR dokumen.
+      - Skenario di data yang tidak punya heading pasangan di template dilewati
+        dengan aman (warning), tidak membuat proses gagal.
+
+    Teknik python-docx: python-docx tidak punya API "insert setelah". Kita pakai
+    paragraph.insert_paragraph_before(...) pada heading BERIKUTNYA (atau
+    doc.add_paragraph untuk skenario terakhir) sehingga gambar/screenshot tetap
+    utuh dan urutan terjaga.
+    """
+
+    # Nomor ASPI di awal teks heading, mis. "18.1", "18,18", "3.5"
+    _ASPI_RE = re.compile(r'^\s*(\d+)[.,](\d+)\b')
+
+    def __init__(self, template_path, scenarios, metadata):
+        self.template_path = template_path
+        self.scenarios = scenarios
+        self.metadata = metadata
+        self.doc = Document(template_path)
+        # Map nomor ASPI -> skenario (skenario pertama untuk nomor tsb).
+        self.by_aspi = {}
+        for s in scenarios:
+            aspi = s.get("aspi_no", "")
+            if aspi and aspi not in self.by_aspi:
+                self.by_aspi[aspi] = s
+
+    @classmethod
+    def _heading_aspi(cls, paragraph):
+        """Kembalikan nomor ASPI (mis. '18.1') jika paragraf ini heading skenario."""
+        text = (paragraph.text or "").strip()
+        if not text:
+            return None
+        m = cls._ASPI_RE.match(text)
+        if not m:
+            return None
+        return f"{m.group(1)}.{m.group(2)}"
+
+    def _find_scenario_headings(self):
+        """Temukan paragraf heading skenario di template beserta nomor ASPI-nya.
+
+        Return list of (index_in_doc_paragraphs, paragraph, aspi_no) urut sesuai
+        kemunculan di dokumen. Hanya heading yang nomornya ADA di data yang
+        dianggap titik sisip (agar teks lain berangka seperti '1.1 Pendahuluan'
+        tidak keliru dikenali).
+        """
+        headings = []
+        for idx, p in enumerate(self.doc.paragraphs):
+            aspi = self._heading_aspi(p)
+            if aspi and aspi in self.by_aspi:
+                headings.append((idx, p, aspi))
+        return headings
+
+    def _insert_line_before(self, ref_paragraph, text, bold=False,
+                            monospace=False, label=None):
+        """Sisipkan satu paragraf SEBELUM ref_paragraph.
+
+        Jika ref_paragraph None -> tambahkan di akhir dokumen (skenario terakhir).
+        Mengembalikan paragraf baru. Pakai insert_paragraph_before agar screenshot
+        yang berada sebelum heading berikutnya tetap utuh dan urutan terjaga.
+        """
+        if ref_paragraph is None:
+            p = self.doc.add_paragraph()
+        else:
+            p = ref_paragraph.insert_paragraph_before()
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        if monospace:
+            p.paragraph_format.left_indent = Cm(0.5)
+        if label is not None:
+            run = p.add_run(label)
+            run.bold = True
+        if text:
+            run = p.add_run(text)
+            if monospace:
+                run.font.name = 'Consolas'
+                run.font.size = Pt(8)
+            run.bold = bold
+        return p
+
+    def _insert_scenario_block(self, ref_paragraph, scenario):
+        """Sisipkan Expected Result, Request, dan Response untuk satu skenario.
+
+        Disisipkan berurutan SEBELUM ref_paragraph (heading berikutnya) sehingga
+        muncul TEPAT setelah screenshot skenario. Multi-baris Request/Response
+        dirender satu paragraf per baris (Word tidak merender '\\n' dalam satu run).
+        """
+        # Baris kosong pemisah dari screenshot di atasnya.
+        self._insert_line_before(ref_paragraph, "")
+
+        # Expected Result (label bold + nilai pada paragraf yang sama).
+        p = (self.doc.add_paragraph() if ref_paragraph is None
+             else ref_paragraph.insert_paragraph_before())
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        p.add_run("Expected Result: ").bold = True
+        p.add_run(scenario.get("expected_result", ""))
+
+        # Request (URL + Headers + Body), satu baris per paragraf.
+        self._insert_line_before(ref_paragraph, "", label="Request:")
+        for line in str(scenario.get("request", "") or "").split('\n'):
+            self._insert_line_before(ref_paragraph, line, monospace=True)
+
+        # Response, satu baris per paragraf.
+        self._insert_line_before(ref_paragraph, "", label="Response:")
+        for line in str(scenario.get("response", "") or "").split('\n'):
+            self._insert_line_before(ref_paragraph, line, monospace=True)
+
+    def merge(self, output_path):
+        """Sisipkan konten generator ke template lalu simpan dokumen gabungan."""
+        headings = self._find_scenario_headings()
+
+        if not headings:
+            print("      [WARNING] Tidak ada heading skenario bernomor ASPI yang "
+                  "cocok di template. Tidak ada yang disisipkan.")
+            print("      Pastikan tiap skenario diawali heading bernomor, mis. "
+                  "'18.1 ...', '18.2 ...'.")
+
+        # Nomor ASPI yang benar-benar ada headingnya di template.
+        matched_aspi = {aspi for (_, _, aspi) in headings}
+
+        inserted = 0
+        for i, (idx, para, aspi) in enumerate(headings):
+            scenario = self.by_aspi.get(aspi)
+            if scenario is None:
+                continue
+            # Titik sisip = tepat sebelum heading skenario BERIKUTNYA (jika ada),
+            # atau di akhir dokumen untuk skenario terakhir.
+            if i + 1 < len(headings):
+                next_para = headings[i + 1][1]
+            else:
+                next_para = None
+            self._insert_scenario_block(next_para, scenario)
+            inserted += 1
+            print(f"      -> Skenario {aspi} disisipkan setelah screenshot.")
+
+        # Peringatkan skenario data yang tidak punya heading di template.
+        missing = [a for a in self.by_aspi.keys() if a not in matched_aspi]
+        if missing:
+            print(f"      [WARNING] {len(missing)} skenario data tanpa heading di "
+                  f"template (dilewati): {', '.join(sorted(missing))}")
+
+        self.doc.save(output_path)
+        print(f"[OK] UAT Result (gabungan template) saved: {output_path}")
+        print(f"      -> {inserted} skenario disisipkan ke template.")
+        return inserted
+
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
+
+def parse_args():
+    """Parse argumen CLI (kompatibel dengan pemakaian lama).
+
+    Pemakaian lama tetap jalan: `python generate_uat_docs.py <excel.xlsx>`
+    (excel bersifat positional & opsional; jika tidak diberi, auto-detect .xlsx
+    di direktori kerja saat ini seperti sebelumnya).
+
+    Opsi baru --template menyisipkan hasil UAT Script ke dalam template UAT
+    Result .docx milik user yang sudah berisi screenshot tiap skenario:
+    tiap skenario disisipkan TEPAT DI BAWAH screenshot-nya, dan output ditulis
+    ke output/UAT_Result_from_template_<timestamp>.docx. Tanpa --template,
+    perilaku default (generate UAT Result & Lampiran 7C dari nol) dipertahankan.
+    """
+    parser = argparse.ArgumentParser(
+        description="QRIS Document Generator - generate UAT Result & Lampiran 7C "
+                    "dari UAT Script Excel. Tanpa --template: buat kedua dokumen "
+                    "dari nol (perilaku lama). Dengan --template: jadikan template "
+                    "UAT Result ber-screenshot milik Anda sebagai dasar dan sisipkan "
+                    "hasil UAT Script (Expected Result, Request, Response) di bawah "
+                    "screenshot tiap skenario (khusus versi Python).")
+    parser.add_argument(
+        "excel", nargs="?", default=None,
+        help="Path file UAT Script Excel (.xlsx). Jika kosong, auto-detect .xlsx "
+             "di direktori kerja saat ini.")
+    parser.add_argument(
+        "--template", default=None, metavar="UAT_RESULT.docx",
+        help="Path template UAT Result .docx (sudah berisi screenshot tiap "
+             "skenario). Bila diberikan, hasil UAT Script disisipkan di bawah "
+             "screenshot tiap skenario dan disimpan sebagai UAT Result gabungan. "
+             "Pencocokan skenario memakai nomor ASPI di awal heading (mis. '18.1').")
+    return parser.parse_args()
+
 
 def main():
     """Main function to generate UAT documents."""
     print("=" * 60)
-    print("  QRIS Merchant Aggregator - UAT Document Generator")
+    print("  QRIS Document Generator")
     print("  Bank Sahabat Sampoerna (BSS)")
     print("=" * 60)
     print()
 
-    # Input file
-    if len(sys.argv) > 1:
-        input_excel = sys.argv[1]
+    args = parse_args()
+
+    # Input file (positional opsional; jika tidak diberi auto-detect .xlsx di cwd).
+    if args.excel:
+        input_excel = args.excel
     else:
-        # Auto-find .xlsx file in current directory
         xlsx_files = [f for f in os.listdir('.') if f.endswith('.xlsx') and not f.startswith('~')]
         if xlsx_files:
             input_excel = xlsx_files[0]
             print(f"[INFO] Auto-detected Excel file: {input_excel}")
         else:
             print("ERROR: File Excel (.xlsx) tidak ditemukan.")
-            print(f"Usage: python {sys.argv[0]} <path_to_uat_script.xlsx>")
+            print(f"Usage: python {os.path.basename(sys.argv[0])} <path_to_uat_script.xlsx> [--template <uat_result.docx>]")
             sys.exit(1)
 
     if not os.path.exists(input_excel):
         print(f"ERROR: File tidak ditemukan: {input_excel}")
+        sys.exit(1)
+
+    template_path = args.template
+    if template_path and not os.path.exists(template_path):
+        print(f"ERROR: File template tidak ditemukan: {template_path}")
         sys.exit(1)
 
     # Output paths
@@ -1493,26 +1699,48 @@ def main():
     print(f"      -> Tested: {tested}, Skipped: {skipped}, Total: {len(scenarios)}")
     print()
 
-    # Generate UAT Result
-    print(f"[2/3] Generating UAT Result...")
-    uat_gen = UATResultGenerator(scenarios, metadata)
-    uat_gen.generate(uat_result_path)
-    print()
+    if template_path:
+        # MODE TEMPLATE: template UAT Result ber-screenshot milik user jadi DASAR;
+        # hasil UAT Script disisipkan di bawah screenshot tiap skenario.
+        merged_path = os.path.join(
+            output_dir, f"UAT_Result_from_template_{timestamp}.docx")
+        print(f"[2/3] Menyisipkan hasil UAT Script ke template: {template_path}")
+        merger = TemplateMerger(template_path, scenarios, metadata)
+        merger.merge(merged_path)
+        print()
 
-    # Generate Lampiran 7C
-    print(f"[3/3] Generating Lampiran 7C (Berita Acara)...")
-    lamp_gen = Lampiran7CGenerator(scenarios, metadata)
-    lamp_gen.generate(lampiran_7c_path)
-    print()
+        # Lampiran 7C tetap dihasilkan dari nol (tidak ada template untuknya).
+        print(f"[3/3] Generating Lampiran 7C (Berita Acara)...")
+        lamp_gen = Lampiran7CGenerator(scenarios, metadata)
+        lamp_gen.generate(lampiran_7c_path)
+        print()
 
-    # Summary
-    print("=" * 60)
-    print("  SELESAI!")
-    print("=" * 60)
-    print(f"  Output files:")
-    print(f"    1. {uat_result_path}")
-    print(f"    2. {lampiran_7c_path}")
-    print()
+        print("=" * 60)
+        print("  SELESAI!")
+        print("=" * 60)
+        print(f"  Output files:")
+        print(f"    1. {merged_path}  (UAT Result gabungan dari template)")
+        print(f"    2. {lampiran_7c_path}")
+        print()
+    else:
+        # MODE LAMA (default): generate UAT Result & Lampiran 7C dari nol.
+        print(f"[2/3] Generating UAT Result...")
+        uat_gen = UATResultGenerator(scenarios, metadata)
+        uat_gen.generate(uat_result_path)
+        print()
+
+        print(f"[3/3] Generating Lampiran 7C (Berita Acara)...")
+        lamp_gen = Lampiran7CGenerator(scenarios, metadata)
+        lamp_gen.generate(lampiran_7c_path)
+        print()
+
+        print("=" * 60)
+        print("  SELESAI!")
+        print("=" * 60)
+        print(f"  Output files:")
+        print(f"    1. {uat_result_path}")
+        print(f"    2. {lampiran_7c_path}")
+        print()
 
     # Validation summary
     validator = ResultValidator()

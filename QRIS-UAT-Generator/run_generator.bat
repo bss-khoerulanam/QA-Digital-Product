@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
-title QRIS UAT Document Generator - Bank Sahabat Sampoerna
+title QRIS Document Generator - Bank Sahabat Sampoerna
 echo ============================================================
-echo   QRIS Merchant Aggregator - UAT Document Generator
+echo   QRIS Document Generator
 echo   Bank Sahabat Sampoerna (BSS)
 echo ============================================================
 echo.
