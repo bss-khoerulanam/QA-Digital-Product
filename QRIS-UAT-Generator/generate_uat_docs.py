@@ -920,6 +920,31 @@ def create_table_with_borders(doc, rows, cols):
     return table
 
 
+def set_fixed_column_widths(table, col_widths):
+    """Force proportional column widths to stick in Word.
+
+    python-docx frequently ignores ``table.columns[i].width`` unless autofit is
+    disabled, the table layout is fixed, and the width is set on every CELL.
+    This helper does all three so the intended proportional widths (with
+    Request/Response the widest columns) survive in the rendered document.
+    """
+    # Disable autofit so Word honors the explicit grid instead of resizing.
+    table.autofit = False
+    table.allow_autofit = False
+
+    # Force a fixed table layout via tblLayout so the tblGrid is authoritative.
+    tblPr = table._tbl.tblPr
+    layout = parse_xml(f'<w:tblLayout {nsdecls("w")} w:type="fixed"/>')
+    tblPr.append(layout)
+
+    # Set width on the columns AND on every cell in every row.
+    for i, width in enumerate(col_widths):
+        table.columns[i].width = width
+    for row in table.rows:
+        for i, width in enumerate(col_widths):
+            row.cells[i].width = width
+
+
 def add_cell_text(cell, text, font_name='Calibri', font_size=Pt(8),
                   bold=False, color=None, alignment=None):
     """Add formatted text to a table cell, properly handling newlines."""
@@ -1061,10 +1086,12 @@ class Lampiran7CGenerator:
         num_rows = len(qr_scenarios) + 1  # +1 for header
         table = create_table_with_borders(self.doc, num_rows, 8)
 
-        # Set column widths
+        # Proportional column widths. Request/Response are the widest so their
+        # multi-line payloads stay readable; No/Result are narrow. Total 38.5 cm
+        # fits the A3 landscape text area (42.0 cm page, 1.0 cm side margins).
+        # Applied via set_fixed_column_widths() below so the widths actually
+        # stick in Word (autofit off + fixed tblLayout + per-cell widths).
         col_widths = [Cm(1.0), Cm(2.5), Cm(4.0), Cm(3.5), Cm(11.0), Cm(11.0), Cm(1.5), Cm(4.0)]
-        for i, width in enumerate(col_widths):
-            table.columns[i].width = width
 
         # Header row
         headers = ["No", "Service", "Scenario", "Expected Result",
@@ -1132,6 +1159,9 @@ class Lampiran7CGenerator:
                          alignment=WD_ALIGN_PARAGRAPH.CENTER)
             # Col 7: Notes
             add_cell_text(row.cells[7], notes, font_size=Pt(7))
+
+        # Lock in the proportional widths so Word does not autofit them away.
+        set_fixed_column_widths(table, col_widths)
 
     def _extract_scenario_name(self, langkah_tes):
         """Extract scenario name from Langkah Tes, removing ASPI number prefix."""
@@ -1302,17 +1332,6 @@ class UATResultGenerator:
         p = self.doc.add_paragraph()
         p.add_run("Response:").bold = True
         self._add_monospace_block(scenario.get("response", ""))
-
-        # Result
-        result = self.validator.validate(scenario)
-        p = self.doc.add_paragraph()
-        p.add_run("Result: ").bold = True
-        result_run = p.add_run(result)
-        result_run.bold = True
-        if result == "PASS":
-            result_run.font.color.rgb = RGBColor(0, 128, 0)
-        elif result == "NOT PASS":
-            result_run.font.color.rgb = RGBColor(255, 0, 0)
 
     def _add_monospace_block(self, text):
         """Render a multi-line text block with each line on its own paragraph.

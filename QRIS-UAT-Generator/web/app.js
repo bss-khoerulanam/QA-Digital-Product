@@ -897,24 +897,6 @@ if (IS_BROWSER) {
                 if (s.response) {
                     monospaceParagraphs(s.response, 16, 720).forEach(p => children.push(p));
                 }
-
-                const result = validateScenario(s);
-                const resultColor = result === 'PASS' ? '008000' : (result === 'NOT PASS' ? 'FF0000' : '666666');
-                children.push(new Paragraph({
-                    children: [
-                        new TextRun({ text: 'Result: ', bold: true, size: 20 }),
-                        new TextRun({ text: result, bold: true, size: 20, color: resultColor })
-                    ]
-                }));
-
-                if (s.hasil_aktual) {
-                    children.push(new Paragraph({
-                        children: [
-                            new TextRun({ text: 'Hasil Aktual: ', bold: true, size: 20 }),
-                            new TextRun({ text: s.hasil_aktual, size: 20 })
-                        ]
-                    }));
-                }
             }
             children.push(new Paragraph({ text: '' }));
         });
@@ -972,9 +954,19 @@ if (IS_BROWSER) {
         updateMetadataFromUI();
 
         const { Document, Packer, Paragraph, TextRun, AlignmentType,
-                Table, TableRow, TableCell, WidthType, ShadingType, PageOrientation } = docx;
+                Table, TableRow, TableCell, WidthType, ShadingType, PageOrientation,
+                TableLayoutType } = docx;
 
         const children = [];
+
+        // Proportional column widths (twips) for the 8 columns
+        // [No, Service, Scenario, Expected Result, Request, Response, Result, Notes].
+        // Request/Response are the widest; No/Result are narrow. The total (15340)
+        // fits comfortably inside the A3 landscape text area emitted below
+        // (page 23811 twips wide, 680 twip side margins => 22451 usable, ~7111 twips
+        // of slack) so the fixed tblGrid is honored by Word without collapse.
+        const COL_WIDTHS = [520, 1350, 2150, 2000, 3350, 3350, 720, 1900];
+        const TABLE_WIDTH = COL_WIDTHS.reduce((a, b) => a + b, 0); // 15340 twips
 
         children.push(new Paragraph({
             alignment: AlignmentType.CENTER,
@@ -1004,13 +996,13 @@ if (IS_BROWSER) {
 
         const headerTexts = ['No', 'Service', 'Scenario', 'Expected Result', 'Request', 'Response', 'Result', 'Notes'];
         const headerRow = new TableRow({
-            children: headerTexts.map(h => new TableCell({
+            children: headerTexts.map((h, i) => new TableCell({
                 children: [new Paragraph({
                     alignment: AlignmentType.CENTER,
                     children: [new TextRun({ text: h, bold: true, size: 16, color: 'FFFFFF' })]
                 })],
                 shading: { type: ShadingType.SOLID, color: '4472C4' },
-                width: { size: h === 'No' ? 600 : (h === 'Result' ? 800 : 1500), type: WidthType.DXA }
+                width: { size: COL_WIDTHS[i], type: WidthType.DXA }
             }))
         });
 
@@ -1030,21 +1022,26 @@ if (IS_BROWSER) {
 
             return new TableRow({
                 children: [
-                    multiLineCell(noLabel, { width: 600 }),
-                    multiLineCell(s.nama_modul, { width: 1500 }),
-                    multiLineCell(name, { width: 1500 }),
-                    multiLineCell(s.expected_result, { width: 1500 }),
-                    multiLineCell(s.request || '', { width: 1500, font: 'Consolas' }),
-                    multiLineCell(s.response || '', { width: 1500, font: 'Consolas' }),
-                    multiLineCell(resultText, { width: 800, bold: true, color: resultColor, alignment: AlignmentType.CENTER }),
-                    multiLineCell(notesText, { width: 1500 })
+                    multiLineCell(noLabel, { width: COL_WIDTHS[0] }),
+                    multiLineCell(s.nama_modul, { width: COL_WIDTHS[1] }),
+                    multiLineCell(name, { width: COL_WIDTHS[2] }),
+                    multiLineCell(s.expected_result, { width: COL_WIDTHS[3] }),
+                    multiLineCell(s.request || '', { width: COL_WIDTHS[4], font: 'Consolas' }),
+                    multiLineCell(s.response || '', { width: COL_WIDTHS[5], font: 'Consolas' }),
+                    multiLineCell(resultText, { width: COL_WIDTHS[6], bold: true, color: resultColor, alignment: AlignmentType.CENTER }),
+                    multiLineCell(notesText, { width: COL_WIDTHS[7] })
                 ]
             });
         });
 
+        // ONE consistent width strategy: explicit DXA table width + explicit
+        // columnWidths (so docx.js emits a matching tblGrid) + fixed layout so
+        // Word honors the grid instead of autofitting to a degenerate ~100-twip grid.
         children.push(new Table({
             rows: [headerRow, ...dataRows],
-            width: { size: 100, type: WidthType.PERCENTAGE }
+            width: { size: TABLE_WIDTH, type: WidthType.DXA },
+            columnWidths: COL_WIDTHS,
+            layout: TableLayoutType.FIXED
         }));
 
         children.push(new Paragraph({ text: '' }));
@@ -1067,7 +1064,24 @@ if (IS_BROWSER) {
 
         const doc = new Document({
             sections: [{
-                properties: { page: { size: { orientation: PageOrientation.LANDSCAPE } } },
+                properties: {
+                    page: {
+                        // A3 landscape. NOTE: under PageOrientation.LANDSCAPE docx.js
+                        // swaps the pair so the LARGER value becomes the emitted page
+                        // width (w:w) and the smaller becomes the height (w:h). To get
+                        // the wide A3 long side (23811) as the actual page width we must
+                        // pass width=16838 / height=23811 here; docx.js then emits
+                        // <w:pgSz w:w="23811" w:h="16838" w:orient="landscape"/>.
+                        // Usable width = 23811 - (680 + 680) = 22451 twips, so the
+                        // 15340-twip table has ~7111 twips (~12.5 cm) of headroom.
+                        size: {
+                            orientation: PageOrientation.LANDSCAPE,
+                            width: 16838,
+                            height: 23811
+                        },
+                        margin: { top: 720, right: 680, bottom: 720, left: 680 }
+                    }
+                },
                 children: children
             }]
         });
