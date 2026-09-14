@@ -74,19 +74,21 @@ const RemarksParser = {
     },
 
     _splitRequestResponse(text) {
-        // Pattern 1: explicit "Response:" label
-        const responseMarkers = [
-            /\nResponse:\s*\n/,
-            /\nResponse:\s*$/m,
-            /^Response:\s*\n/
-        ];
-        for (const pattern of responseMarkers) {
-            const match = text.match(pattern);
-            if (match) {
-                const start = match.index;
-                const end = match.index + match[0].length;
-                return [text.slice(0, start).trim(), text.slice(end).trim()];
-            }
+        // Pattern 1: a standalone "Response" line acting as request|response
+        // separator. Covers BOTH the classic "Response:" label (with colon) AND
+        // the notification format used by e.g. qr-mpm-notify (Kirimo row 61),
+        // where the marker is just the word "Response" on its own line WITHOUT a
+        // colon and WITHOUT an "HTTP/1.1 ..." status line, directly followed by
+        // the JSON response body ({ "responseCode": "2005200", ... }).
+        //
+        // Only a line whose trimmed content is exactly "Response" or "Response:"
+        // is treated as the separator, so the word "response" inside a sentence
+        // or a JSON key (e.g. "responseCode") is never mistaken for one.
+        const responseLine = text.match(/^[ \t]*Response:?[ \t]*$/m);
+        if (responseLine) {
+            const start = responseLine.index;
+            const end = responseLine.index + responseLine[0].length;
+            return [text.slice(0, start).trim(), text.slice(end).trim()];
         }
 
         // Pattern 2: request JSON body immediately followed by an HTTP status line
@@ -715,11 +717,14 @@ if (IS_BROWSER) {
             if (s.is_skipped) skippedSet.add(s.nomor_kasus_tes || s.aspi_no);
         });
 
-        // Update config UI
-        document.getElementById('configCard').style.display = 'block';
-        document.getElementById('namaPengguna').value = metadata.nama_pengguna || '';
-        document.getElementById('tanggalPengujian').value = metadata.tanggal_pengujian || '';
-        document.getElementById('skippedScenarios').value = Array.from(skippedSet).filter(Boolean).join(', ');
+        // Populate the (now-hidden) config inputs so their .value stays in sync
+        // with the auto-detected metadata. The "Konfigurasi (Opsional)" card is
+        // intentionally NOT shown (per user request); we keep the elements in
+        // the DOM only so updateMetadataFromUI() can still read them safely.
+        // NOTE: configCard is deliberately never set to display:block here.
+        setInputValue('namaPengguna', metadata.nama_pengguna || '');
+        setInputValue('tanggalPengujian', metadata.tanggal_pengujian || '');
+        setInputValue('skippedScenarios', Array.from(skippedSet).filter(Boolean).join(', '));
 
         addLog(`File diproses: ${parsedScenarios.length} skenario ditemukan (header baris ${result.headerRowIdx + 1}, layout ${result.layout}).`, 'info');
 
@@ -727,17 +732,22 @@ if (IS_BROWSER) {
     };
 
     // ---- Results display ---------------------------------------------------
+    // The "Hasil Validasi" card (resultsCard) is intentionally NOT shown (per
+    // user request). We still run the full validation + summary computation so
+    // the generated documents stay correct, and we still reveal the "Generate
+    // Dokumen" card so the user can produce the .docx files.
     function validateAndShowResults() {
         const resultsCard = document.getElementById('resultsCard');
         const generateCard = document.getElementById('generateCard');
         const resultsBody = document.getElementById('resultsBody');
         const summaryCards = document.getElementById('summaryCards');
 
-        resultsCard.style.display = 'block';
-        generateCard.style.display = 'block';
+        // Keep resultsCard hidden; only the Generate card is revealed.
+        if (resultsCard) resultsCard.style.display = 'none';
+        if (generateCard) generateCard.style.display = 'block';
 
         let passed = 0, failed = 0, na = 0, notTested = 0;
-        resultsBody.innerHTML = '';
+        if (resultsBody) resultsBody.innerHTML = '';
 
         parsedScenarios.forEach(s => {
             const result = validateScenario(s);
@@ -754,37 +764,58 @@ if (IS_BROWSER) {
             else if (result === 'NOT PASS') badgeClass = 'badge-fail';
             else if (result === 'N/A') badgeClass = 'badge-na';
 
-            const name = s.scenario_name || s.langkah_tes || '';
-            const noLabel = s.aspi_no || s.nomor_kasus_tes || '';
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td>${escapeHtml(noLabel)}</td>
-                <td>${escapeHtml(s.nama_modul)}</td>
-                <td>${escapeHtml(name.substring(0, 50))}${name.length > 50 ? '...' : ''}</td>
-                <td><code>${escapeHtml(expectedCode)}</code></td>
-                <td><code>${escapeHtml(actualCode)}</code></td>
-                <td><span class="badge ${badgeClass}">${result}</span></td>
-                <td>${escapeHtml((s.hasil_aktual || '').substring(0, 30))}</td>
-            `;
-            resultsBody.appendChild(row);
+            // The results table is hidden, but keep populating it (when present)
+            // so nothing breaks if the card is ever re-enabled.
+            if (resultsBody) {
+                const name = s.scenario_name || s.langkah_tes || '';
+                const noLabel = s.aspi_no || s.nomor_kasus_tes || '';
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${escapeHtml(noLabel)}</td>
+                    <td>${escapeHtml(s.nama_modul)}</td>
+                    <td>${escapeHtml(name.substring(0, 50))}${name.length > 50 ? '...' : ''}</td>
+                    <td><code>${escapeHtml(expectedCode)}</code></td>
+                    <td><code>${escapeHtml(actualCode)}</code></td>
+                    <td><span class="badge ${badgeClass}">${result}</span></td>
+                    <td>${escapeHtml((s.hasil_aktual || '').substring(0, 30))}</td>
+                `;
+                resultsBody.appendChild(row);
+            }
         });
 
         const total = parsedScenarios.length;
-        summaryCards.innerHTML = `
-            <div class="summary-card total"><div class="number">${total}</div><div class="label">Total Skenario</div></div>
-            <div class="summary-card pass"><div class="number">${passed}</div><div class="label">PASS</div></div>
-            <div class="summary-card fail"><div class="number">${failed}</div><div class="label">NOT PASS</div></div>
-            <div class="summary-card na"><div class="number">${na + notTested}</div><div class="label">N/A / Belum Diisi</div></div>
-        `;
+        if (summaryCards) {
+            summaryCards.innerHTML = `
+                <div class="summary-card total"><div class="number">${total}</div><div class="label">Total Skenario</div></div>
+                <div class="summary-card pass"><div class="number">${passed}</div><div class="label">PASS</div></div>
+                <div class="summary-card fail"><div class="number">${failed}</div><div class="label">NOT PASS</div></div>
+                <div class="summary-card na"><div class="number">${na + notTested}</div><div class="label">N/A / Belum Diisi</div></div>
+            `;
+        }
 
         const denom = total - na - notTested;
         const passRate = denom > 0 ? (passed / denom) * 100 : 0;
-        document.getElementById('progressFill').style.width = `${Math.min(passRate, 100)}%`;
+        const progressFill = document.getElementById('progressFill');
+        if (progressFill) progressFill.style.width = `${Math.min(passRate, 100)}%`;
+
+        addLog(`Validasi selesai: PASS ${passed}, NOT PASS ${failed}, N/A/Belum Diisi ${na + notTested} dari ${total} skenario.`, 'info');
     };
 
     function escapeHtml(str) {
         return String(str == null ? '' : str)
             .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // Safe getters/setters for the (hidden) config inputs. The Konfigurasi and
+    // Hasil Validasi cards are hidden per user request; these helpers make the
+    // code tolerant whether the inputs are merely hidden or removed entirely.
+    function setInputValue(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.value = value;
+    }
+    function getInputValue(id) {
+        const el = document.getElementById(id);
+        return el ? el.value : '';
     }
 
     // ---- Helper: build docx paragraphs from a multi-line monospace block ----
@@ -1100,12 +1131,15 @@ if (IS_BROWSER) {
     };
 
     function updateMetadataFromUI() {
-        metadata.nama_penyedia = document.getElementById('namaPenyedia').value || metadata.nama_penyedia;
-        metadata.nama_pengguna = document.getElementById('namaPengguna').value || metadata.nama_pengguna;
-        metadata.nama_layanan = document.getElementById('namaLayanan').value || metadata.nama_layanan;
-        metadata.tanggal_pengujian = document.getElementById('tanggalPengujian').value || metadata.tanggal_pengujian;
+        // The config inputs live inside the hidden "Konfigurasi (Opsional)" card.
+        // Read them defensively and fall back to the auto-detected metadata (from
+        // the Excel) whenever an input is missing or left blank.
+        metadata.nama_penyedia = getInputValue('namaPenyedia') || metadata.nama_penyedia;
+        metadata.nama_pengguna = getInputValue('namaPengguna') || metadata.nama_pengguna;
+        metadata.nama_layanan = getInputValue('namaLayanan') || metadata.nama_layanan;
+        metadata.tanggal_pengujian = getInputValue('tanggalPengujian') || metadata.tanggal_pengujian;
 
-        const skippedInput = document.getElementById('skippedScenarios').value;
+        const skippedInput = getInputValue('skippedScenarios');
         if (skippedInput.trim()) {
             const additional = skippedInput.split(',').map(s => s.trim()).filter(Boolean);
             additional.forEach(no => {

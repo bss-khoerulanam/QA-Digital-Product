@@ -142,19 +142,21 @@ class RemarksParser:
         # Look for "Response:" or "Response:\n" separator
         # Also handle "HTTP/1.1 XXX" as response start after a blank line
         
-        # Pattern 1: Explicit "Response:" label
-        response_markers = [
-            r'\nResponse:\s*\n',
-            r'\nResponse:\s*$',
-            r'^Response:\s*\n',
-        ]
-        
-        for pattern in response_markers:
-            match = re.search(pattern, text, re.MULTILINE)
-            if match:
-                request_part = text[:match.start()].strip()
-                response_part = text[match.end():].strip()
-                return request_part, response_part
+        # Pattern 1: A standalone "Response" line acting as request|response
+        # separator. This covers BOTH the classic "Response:" label (with colon)
+        # AND the notification format used by e.g. qr-mpm-notify (Kirimo row 61),
+        # where the marker is just the word "Response" on its own line WITHOUT a
+        # colon and WITHOUT an "HTTP/1.1 ..." status line, directly followed by
+        # the JSON response body ({ "responseCode": "2005200", ... }).
+        #
+        # We only treat a line whose trimmed content is exactly "Response" or
+        # "Response:" as the separator, so the word "response" appearing inside a
+        # sentence or a JSON key (e.g. "responseCode") is never mistaken for one.
+        response_line = re.search(r'^[ \t]*Response:?[ \t]*$', text, re.MULTILINE)
+        if response_line:
+            request_part = text[:response_line.start()].strip()
+            response_part = text[response_line.end():].strip()
+            return request_part, response_part
 
         # Pattern 2: Look for HTTP response line after request body (JSON followed by HTTP/1.1)
         # Find the boundary between request JSON and response HTTP status
